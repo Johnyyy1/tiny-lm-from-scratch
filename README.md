@@ -1,74 +1,324 @@
-# minibpetokenizer
+# Tiny LM from Scratch
 
-See the complete [CLI guide](CLI.md) for setup, training, checkpoint resumption,
-generation, evaluation, configuration, and troubleshooting.
+A small language model built from scratch in PyTorch, including a custom BPE tokenizer, decoder-only Transformer, training loop, checkpointing, evaluation, and text generation.
 
-Install the dependency in the project virtual environment:
+The purpose of this project is to understand how the main components of a language model work together without relying on high-level Transformer or tokenizer libraries.
 
-```sh
-python3 -m pip install -r requirements.txt
+## Overview
+
+The project implements the complete text-generation pipeline:
+
+```text
+Raw text
+   ↓
+BPE tokenizer
+   ↓
+Token IDs
+   ↓
+Decoder-only Transformer
+   ↓
+Next-token probabilities
+   ↓
+Generated text
 ```
 
-Train a new model:
+It is designed as an educational implementation rather than a production-ready language-model framework.
 
-```sh
-python3 minibpe.py train
+## Features
+
+* Custom BPE tokenizer
+* Tokenizer training on arbitrary text datasets
+* Decoder-only Transformer implemented in PyTorch
+* Multi-head causal self-attention
+* Token and positional embeddings
+* Feed-forward Transformer blocks
+* Weight tying between embeddings and output projection
+* AdamW optimizer
+* Learning-rate warmup and cosine decay
+* Mixed-precision training where supported
+* Training and validation loss evaluation
+* Resumable checkpoints
+* KV cache for faster text generation
+* Temperature and top-k sampling
+* CUDA, Apple Silicon and CPU support
+
+## Architecture
+
+The model follows a decoder-only Transformer architecture similar to small GPT-style language models.
+
+Each Transformer block contains:
+
+```text
+Input
+  ├── Layer normalization
+  ├── Causal multi-head self-attention
+  ├── Residual connection
+  ├── Layer normalization
+  ├── Feed-forward network
+  └── Residual connection
 ```
 
-The script automatically uses CUDA, Apple Metal (`mps`), or CPU in that order.
-CLI arguments override the corresponding environment variables:
+The causal attention mask prevents each token from accessing future tokens.
 
-```sh
-python3 minibpe.py train \
-  --max-steps 1000 \
-  --batch-size 16 \
-  --eval-interval 100 \
-  --checkpoint checkpoints/latest.pt
+The model predicts the next token for every position in the input sequence.
+
+## Tokenizer
+
+The tokenizer builds its vocabulary using Byte Pair Encoding.
+
+BPE starts with a base vocabulary and repeatedly merges frequent adjacent token pairs into new tokens.
+
+For example:
+
+```text
+l o w e r
+l o w er
+lo w er
+low er
+lower
 ```
 
-Training writes a resumable checkpoint to `checkpoints/latest.pt` by default.
-It contains the model, tokenizer, configuration, optimizer, scheduler, gradient
-scaler, losses, current step, and random-number-generator states.
+Frequent character sequences gradually become individual tokens.
 
-Resume an interrupted or completed run with a higher total step target:
+The tokenizer supports:
 
-```sh
-python3 minibpe.py resume checkpoints/latest.pt --max-steps 200000
+* vocabulary training,
+* text encoding,
+* token decoding,
+* configurable vocabulary size,
+* tokenizer serialization,
+* tokenizer statistics.
+
+A basic tokenizer invariant is:
+
+```python
+tokenizer.decode(tokenizer.encode(text)) == text
 ```
 
-Generate text:
+## Installation
 
-```sh
-python3 minibpe.py generate checkpoints/latest.pt \
-  --prompt "Once upon a time " \
+Clone the repository:
+
+```bash
+git clone https://github.com/Johnyyy1/tiny-lm-from-scratch.git
+cd tiny-lm-from-scratch
+```
+
+Create a virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+Activate it on macOS or Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+Activate it on Windows:
+
+```powershell
+.venv\Scripts\activate
+```
+
+Install the required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Dataset
+
+The model can be trained on any UTF-8 text file.
+
+Place the dataset inside the project, for example:
+
+```text
+data/input.txt
+```
+
+A small dataset such as Tiny Shakespeare is suitable for testing the implementation:
+
+```bash
+curl -o data/input.txt \
+  https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+```
+
+Small datasets are useful for validating the pipeline, but they will not produce a generally capable language model.
+
+## Training
+
+Train the tokenizer and language model:
+
+```bash
+python minibpe.py train \
+  --data-file data/input.txt \
+  --vocab-size 1024 \
+  --max-steps 5000
+```
+
+Example with a smaller model:
+
+```bash
+python minibpe.py train \
+  --data-file data/input.txt \
+  --vocab-size 512 \
+  --seq-len 256 \
+  --d-model 256 \
+  --num-heads 4 \
+  --num-layers 4 \
+  --max-steps 5000
+```
+
+During training, the program reports:
+
+* current step,
+* training loss,
+* validation loss,
+* learning rate,
+* elapsed time,
+* estimated completion progress.
+
+## Resume training
+
+Training can be resumed from a saved checkpoint:
+
+```bash
+python minibpe.py resume checkpoints/latest.pt \
+  --max-steps 10000
+```
+
+Checkpoints include:
+
+* model parameters,
+* optimizer state,
+* training step,
+* model configuration,
+* tokenizer state,
+* recorded metrics,
+* random-number-generator states.
+
+## Generate text
+
+Generate text from a trained checkpoint:
+
+```bash
+python minibpe.py generate checkpoints/latest.pt \
+  --prompt "ROMEO:" \
+  --max-new-tokens 200
+```
+
+Generation can be controlled using temperature and top-k sampling:
+
+```bash
+python minibpe.py generate checkpoints/latest.pt \
+  --prompt "ROMEO:" \
+  --max-new-tokens 200 \
   --temperature 0.8 \
-  --top-k 50 \
-  --max-new-tokens 100
+  --top-k 50
 ```
 
-Evaluate a checkpoint:
+Lower temperatures produce more predictable output.
 
-```sh
-python3 minibpe.py evaluate checkpoints/latest.pt \
-  --split validation \
-  --batch-size 16
+Higher temperatures produce more varied but less reliable output.
+
+## Evaluation
+
+Evaluate a trained checkpoint:
+
+```bash
+python minibpe.py evaluate checkpoints/latest.pt \
+  --data-file data/input.txt
 ```
 
-Run `python3 minibpe.py COMMAND --help` for all command-specific options.
+The evaluation reports loss and perplexity on the selected dataset split.
 
-Common settings and their defaults:
+## Example results
 
-| Variable | Default |
-| --- | ---: |
-| `MINIBPE_DATA_FILE` | `/Users/jonas/Downloads/training_data.txt` |
-| `MINIBPE_VOCAB_SIZE` | `5000` |
-| `MINIBPE_SEQ_LEN` | `512` |
-| `MINIBPE_D_MODEL` | `1024` |
-| `MINIBPE_NUM_HEADS` | `8` |
-| `MINIBPE_D_FF` | `2048` |
-| `MINIBPE_NUM_LAYERS` | `2` |
-| `MINIBPE_BATCH_SIZE` | `16` |
-| `MINIBPE_MAX_STEPS` | `200000` |
-| `MINIBPE_EVAL_INTERVAL` | `100` |
-| `MINIBPE_EVAL_BATCHES` | `4` |
-| `MINIBPE_COMPILE` | `0` |
+The following section should contain results from an actual completed training run.
+
+| Dataset          | Parameters | Training steps | Validation loss | Perplexity | Device |
+| ---------------- | ---------: | -------------: | --------------: | ---------: | ------ |
+| Tiny Shakespeare |        TBD |            TBD |             TBD |        TBD | TBD    |
+
+### Generated sample
+
+```text
+Add an unedited sample generated by the trained model here.
+```
+
+Generated samples should be shown without manually correcting their grammar or punctuation.
+
+## Project structure
+
+```text
+.
+├── minibpe.py
+├── tests/
+├── .github/workflows/tests.yml
+├── README.md
+├── CLI.md
+├── pyproject.toml
+├── requirements.txt
+├── data/
+└── checkpoints/
+```
+
+Run the same checks used by CI:
+
+```bash
+ruff check .
+ruff format --check .
+pytest
+```
+
+## What I learned
+
+This project helped me understand:
+
+* how BPE vocabularies are created,
+* how text is converted into model inputs,
+* how causal self-attention works,
+* how Transformer blocks process sequences,
+* how next-token prediction is trained,
+* how model checkpoints restore training,
+* how autoregressive text generation works,
+* why KV caching improves generation performance,
+* how sampling parameters affect generated text.
+
+## Limitations
+
+* Intended for education rather than production use
+* Trained on relatively small datasets
+* No distributed or multi-GPU training
+* No instruction tuning
+* No preference optimization
+* No advanced positional embeddings such as RoPE
+* Generated text quality depends heavily on training data and compute
+* The code is currently contained primarily in a single Python module
+
+## Roadmap
+
+* [x] BPE tokenizer
+* [x] Decoder-only Transformer
+* [x] Training and validation loop
+* [x] Checkpoint saving and loading
+* [x] Autoregressive text generation
+* [x] KV cache
+* [x] Automated tests and CI
+* [ ] Split the implementation into separate modules
+* [ ] Add training-loss visualizations
+* [ ] Add byte-level BPE
+* [ ] Add benchmark results
+* [ ] Compare the tokenizer with a reference implementation
+
+## Acknowledgements
+
+This project was inspired by educational implementations of tokenizers and Transformer language models, including Andrej Karpathy's neural-network and language-model projects.
+
+The implementation was written as a learning exercise and is not intended to reproduce any specific library.
+
+## License
+
+MIT License

@@ -55,9 +55,8 @@ Start training with the defaults:
 python3 minibpe.py train
 ```
 
-By default, the training data is read from
-`/Users/jonas/Downloads/training_data.txt`, and the latest state is written to
-`checkpoints/latest.pt`.
+By default, the training data is read from `data/input.txt`, and the latest
+state is written to `checkpoints/latest.pt`.
 
 A shorter custom run:
 
@@ -91,6 +90,7 @@ Useful training options:
 | `--batch-size N` | Set the number of sampled sequences per step. |
 | `--max-steps N` | Set the total number of training steps. |
 | `--eval-interval N` | Evaluate after every `N` steps. |
+| `--seed N` | Reproduce model initialization and training batches. |
 | `--checkpoint PATH` | Select the checkpoint output path. |
 | `--checkpoint-interval N` | Save after every `N` steps. |
 | `--compile` | Enable `torch.compile`. |

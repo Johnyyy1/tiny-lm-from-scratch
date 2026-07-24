@@ -1,20 +1,28 @@
+from __future__ import annotations
+
 import argparse
 import heapq
 import math
 import os
+import random
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 
 STOP_TOKEN = "^"
 CHECKPOINT_VERSION = 1
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
 
 
 def env_int(name: str, default: int) -> int:
@@ -51,14 +59,9 @@ class Config:
     seed: int = 42
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         config = cls(
-            data_file=Path(
-                os.environ.get(
-                    "MINIBPE_DATA_FILE",
-                    "/Users/jonas/Downloads/training_data.txt",
-                )
-            ),
+            data_file=Path(os.environ.get("MINIBPE_DATA_FILE", "data/input.txt")),
             vocab_size=env_int("MINIBPE_VOCAB_SIZE", 5000),
             seq_len=env_int("MINIBPE_SEQ_LEN", 512),
             d_model=env_int("MINIBPE_D_MODEL", 1024),
@@ -73,6 +76,7 @@ class Config:
             dropout=env_float("MINIBPE_DROPOUT", 0.1),
             max_token_length=env_int("MINIBPE_MAX_TOKEN_LENGTH", 40),
             compile_model=os.environ.get("MINIBPE_COMPILE", "0") == "1",
+            seed=env_int("MINIBPE_SEED", 42),
         )
         config.validate()
         return config
@@ -97,18 +101,18 @@ class Config:
             raise ValueError("MINIBPE_MAX_STEPS cannot be negative.")
         if self.d_model % self.num_heads:
             raise ValueError("MINIBPE_NUM_HEADS must divide MINIBPE_D_MODEL.")
-        if not 0 <= self.dropout < 1:
+        if not math.isfinite(self.dropout) or not 0 <= self.dropout < 1:
             raise ValueError("MINIBPE_DROPOUT must be in the range [0, 1).")
-        if self.learning_rate <= 0:
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("MINIBPE_LEARNING_RATE must be positive.")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values["data_file"] = str(self.data_file)
         return values
 
     @classmethod
-    def from_dict(cls, values: Dict[str, Any]) -> "Config":
+    def from_dict(cls, values: dict[str, Any]) -> Config:
         values = dict(values)
         values["data_file"] = Path(values["data_file"])
         config = cls(**values)
@@ -116,18 +120,17 @@ class Config:
         return config
 
 
-def load_data(path: Path) -> Tuple[List[str], List[str]]:
+def load_data(path: Path) -> tuple[list[str], list[str]]:
     if not path.is_file():
-        raise FileNotFoundError(
-            f"Training data not found at {path}. "
-            "Set MINIBPE_DATA_FILE to a UTF-8 text file with one sample per line."
-        )
+        raise FileNotFoundError(f"Dataset file {str(path)!r} does not exist.")
 
     with path.open(encoding="utf-8") as handle:
         data = [line.rstrip("\n") for line in handle]
 
+    if not data or all(not sample for sample in data):
+        raise ValueError(f"Dataset file {str(path)!r} is empty.")
     if len(data) < 2:
-        raise ValueError("Training data must contain at least two lines.")
+        raise ValueError("Dataset must contain at least two lines for train/validation splitting.")
     if any(STOP_TOKEN in sample for sample in data):
         raise ValueError(f"Training samples cannot contain the reserved token {STOP_TOKEN!r}.")
 
@@ -135,39 +138,111 @@ def load_data(path: Path) -> Tuple[List[str], List[str]]:
     return data[:split_index], data[split_index:]
 
 
+# =============================================================================
+# Tokenizer
+# =============================================================================
+
+
 class BPETokenizer:
-    """Greedy BPE tokenizer with incremental pair-frequency training."""
+    """Byte-pair-encoding tokenizer trained from a character vocabulary."""
 
-    _TOKEN_ID = object()
-
-    def __init__(self, token_to_id: Dict[str, int]):
-        self.token_to_id = token_to_id
+    def __init__(
+        self,
+        token_to_id: dict[str, int],
+        merges: Sequence[tuple[int, int, int]] | None = None,
+    ):
+        self.token_to_id = dict(token_to_id)
         self.id_to_token = {token_id: token for token, token_id in token_to_id.items()}
         self.stop_id = token_to_id[STOP_TOKEN]
-        self._trie: Dict[object, object] = {}
-
-        for token, token_id in token_to_id.items():
-            node = self._trie
-            for char in token:
-                node = node.setdefault(char, {})
-            node[self._TOKEN_ID] = token_id
+        self.merges = list(merges) if merges is not None else self._infer_merges()
+        self._merge_ranks = {
+            (left_id, right_id): (rank, merged_id)
+            for rank, (left_id, right_id, merged_id) in enumerate(self.merges)
+        }
 
     @property
     def vocab_size(self) -> int:
         return len(self.token_to_id)
 
-    def to_dict(self) -> Dict[str, int]:
+    def to_dict(self) -> dict[str, int]:
+        """Serialize the token vocabulary."""
+
         return dict(self.token_to_id)
 
     @classmethod
-    def from_dict(cls, values: Dict[str, int]) -> "BPETokenizer":
+    def from_dict(
+        cls,
+        values: dict[str, int],
+        merges: Sequence[Sequence[int]] | None = None,
+    ) -> BPETokenizer:
+        """Restore a tokenizer from a serialized vocabulary and merge list."""
+
         token_to_id = {str(token): int(token_id) for token, token_id in values.items()}
         if token_to_id.get(STOP_TOKEN) != 0:
             raise ValueError("Checkpoint tokenizer has an invalid stop token.")
         expected_ids = set(range(len(token_to_id)))
         if set(token_to_id.values()) != expected_ids:
             raise ValueError("Checkpoint tokenizer IDs must be contiguous.")
-        return cls(token_to_id)
+        parsed_merges = None
+        if merges is not None:
+            parsed_merges = [tuple(int(value) for value in merge) for merge in merges]
+            if any(len(merge) != 3 for merge in parsed_merges):
+                raise ValueError("Checkpoint tokenizer has an invalid merge list.")
+        return cls(token_to_id, parsed_merges)
+
+    def _infer_merges(self) -> list[tuple[int, int, int]]:
+        """Reconstruct merge rules from legacy vocab-only checkpoints."""
+
+        merges: list[tuple[int, int, int]] = []
+        ranks: dict[tuple[int, int], tuple[int, int]] = {}
+        ordered_tokens = sorted(self.id_to_token.items())
+        for merged_id, merged_text in ordered_tokens:
+            if len(merged_text) < 2:
+                continue
+            token_ids = [self.token_to_id[char] for char in merged_text]
+            token_ids = self._apply_merges(token_ids, ranks)
+            if len(token_ids) != 2:
+                raise ValueError(
+                    f"Cannot reconstruct merge rule for vocabulary token {merged_text!r}."
+                )
+            left_id, right_id = token_ids
+            merges.append((left_id, right_id, merged_id))
+            ranks[(left_id, right_id)] = (len(merges) - 1, merged_id)
+        return merges
+
+    @staticmethod
+    def _apply_merges(
+        token_ids: list[int],
+        merge_ranks: dict[tuple[int, int], tuple[int, int]],
+    ) -> list[int]:
+        while len(token_ids) > 1:
+            pairs = (
+                (token_ids[index], token_ids[index + 1]) for index in range(len(token_ids) - 1)
+            )
+            candidates = (
+                (merge_ranks[pair][0], pair, merge_ranks[pair][1])
+                for pair in pairs
+                if pair in merge_ranks
+            )
+            try:
+                _, best_pair, merged_id = min(candidates)
+            except ValueError:
+                break
+
+            merged: list[int] = []
+            index = 0
+            while index < len(token_ids):
+                if (
+                    index + 1 < len(token_ids)
+                    and (token_ids[index], token_ids[index + 1]) == best_pair
+                ):
+                    merged.append(merged_id)
+                    index += 2
+                else:
+                    merged.append(token_ids[index])
+                    index += 1
+            token_ids = merged
+        return token_ids
 
     @classmethod
     def train(
@@ -175,11 +250,17 @@ class BPETokenizer:
         samples: Sequence[str],
         target_vocab_size: int,
         max_token_length: int,
-    ) -> "BPETokenizer":
+    ) -> BPETokenizer:
+        """Build a BPE vocabulary from the supplied text samples."""
+
         characters = sorted({char for sample in samples for char in sample})
+        if not characters:
+            raise ValueError("Cannot train a tokenizer on empty text.")
         token_to_id = {char: index + 1 for index, char in enumerate(characters)}
         token_to_id[STOP_TOKEN] = 0
         id_to_token = {token_id: token for token, token_id in token_to_id.items()}
+        merges: list[tuple[int, int, int]] = []
+        recorded_pairs = set()
 
         if target_vocab_size < len(token_to_id):
             raise ValueError(
@@ -188,7 +269,7 @@ class BPETokenizer:
             )
 
         stop_id = token_to_id[STOP_TOKEN]
-        tokens: List[int] = []
+        tokens: list[int] = []
         for sample in samples:
             tokens.extend(token_to_id[char] for char in sample)
             tokens.append(stop_id)
@@ -201,24 +282,20 @@ class BPETokenizer:
             following[-1] = -1
         alive = bytearray(b"\x01") * token_count
 
-        pair_positions: Dict[Tuple[int, int], set] = defaultdict(set)
+        pair_positions: dict[tuple[int, int], set] = defaultdict(set)
         for left in range(token_count - 1):
             right = following[left]
             if tokens[left] != stop_id and tokens[right] != stop_id:
                 pair_positions[(tokens[left], tokens[right])].add(left)
 
-        versions: Dict[Tuple[int, int], int] = defaultdict(int)
+        versions: dict[tuple[int, int], int] = defaultdict(int)
         heap = [
-            (-len(positions), 0, pair)
-            for pair, positions in pair_positions.items()
-            if positions
+            (-len(positions), 0, pair) for pair, positions in pair_positions.items() if positions
         ]
         heapq.heapify(heap)
+        invalid_pairs = set()
 
-        print(f"Initial vocabulary size: {len(token_to_id)}")
-        print(f"Initial token count: {token_count}")
-
-        def current_pair(left: int) -> Optional[Tuple[int, int]]:
+        def current_pair(left: int) -> tuple[int, int] | None:
             if left < 0 or not alive[left]:
                 return None
             right = following[left]
@@ -254,21 +331,21 @@ class BPETokenizer:
 
             merged_text = id_to_token[pair[0]] + id_to_token[pair[1]]
             if len(merged_text) > max_token_length:
-                print(
-                    f"Most frequent merge exceeds {max_token_length} characters "
-                    "(stopping)"
-                )
-                break
+                invalid_pairs.add(pair)
+                continue
 
             merged_id = token_to_id.get(merged_text)
             if merged_id is None:
                 merged_id = len(token_to_id)
                 token_to_id[merged_text] = merged_id
                 id_to_token[merged_id] = merged_text
+            if pair not in recorded_pairs:
+                merges.append((pair[0], pair[1], merged_id))
+                recorded_pairs.add(pair)
 
             changed_pairs = set()
             merged_occurrences = 0
-            for left in sorted(tuple(pair_positions[pair])):
+            for left in sorted(pair_positions[pair]):
                 if current_pair(left) != pair:
                     continue
 
@@ -295,7 +372,7 @@ class BPETokenizer:
             for changed_pair in changed_pairs:
                 versions[changed_pair] += 1
                 count = len(pair_positions[changed_pair])
-                if count:
+                if count and changed_pair not in invalid_pairs:
                     heapq.heappush(
                         heap,
                         (-count, versions[changed_pair], changed_pair),
@@ -303,49 +380,36 @@ class BPETokenizer:
 
             if merged_occurrences == 0:
                 continue
-            if len(token_to_id) % 100 == 0:
-                remaining = sum(alive)
-                reduction = (token_count - remaining) / max(1, token_count)
-                print(
-                    f"Vocabulary: {len(token_to_id)} "
-                    f"({reduction:.1%} token reduction)"
-                )
+        return cls(token_to_id, merges)
 
-        print(f"Final vocabulary size: {len(token_to_id)}")
-        return cls(token_to_id)
+    def encode(self, text: str, add_stop: bool = False) -> list[int]:
+        """Convert text into token IDs using the learned BPE merge order."""
 
-    def encode(self, text: str, add_stop: bool = False) -> List[int]:
-        if add_stop:
-            text += STOP_TOKEN
-
-        result: List[int] = []
-        cursor = 0
-        while cursor < len(text):
-            node = self._trie
-            scan = cursor
-            best_id = None
-            best_end = cursor
-
-            while scan < len(text) and text[scan] in node:
-                node = node[text[scan]]
-                scan += 1
-                token_id = node.get(self._TOKEN_ID)
-                if token_id is not None:
-                    best_id = token_id
-                    best_end = scan
-
-            if best_id is None:
+        token_ids = []
+        for position, char in enumerate(text):
+            try:
+                token_ids.append(self.token_to_id[char])
+            except KeyError:
                 raise ValueError(
-                    f"No vocabulary token matches character {text[cursor]!r} "
-                    f"at position {cursor}."
-                )
-            result.append(best_id)
-            cursor = best_end
-
-        return result
+                    f"Character {char!r} at position {position} is not in the tokenizer vocabulary."
+                ) from None
+        token_ids = self._apply_merges(token_ids, self._merge_ranks)
+        if add_stop:
+            token_ids.append(self.stop_id)
+        return token_ids
 
     def decode(self, token_ids: Iterable[int]) -> str:
-        return "".join(self.id_to_token[token_id] for token_id in token_ids)
+        """Convert token IDs back into text."""
+
+        try:
+            return "".join(self.id_to_token[token_id] for token_id in token_ids)
+        except KeyError as exc:
+            raise ValueError(f"Unknown token ID: {exc.args[0]}") from None
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
 
 
 @dataclass
@@ -413,7 +477,7 @@ def sample_batch(
     batch_size: int,
     generator: torch.Generator,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     indices = torch.randint(len(dataset), (batch_size,), generator=generator)
     valid_lens = dataset.valid_lens[indices]
     width = int(valid_lens.max().item())
@@ -422,6 +486,11 @@ def sample_batch(
     targets = selected[:, 1:].to(device, non_blocking=device.type == "cuda")
     valid_lens = valid_lens.to(device, non_blocking=device.type == "cuda")
     return inputs, targets, valid_lens
+
+
+# =============================================================================
+# Transformer
+# =============================================================================
 
 
 class CausalSelfAttention(nn.Module):
@@ -433,9 +502,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.output = nn.Linear(d_model, d_model, bias=False)
 
-    def _project(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _project(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, _ = x.shape
         qkv = self.qkv(x).view(
             batch,
@@ -457,10 +524,7 @@ class CausalSelfAttention(nn.Module):
         positions = torch.arange(seq_len, device=x.device)
         causal = positions.unsqueeze(0) <= positions.unsqueeze(1)
         valid_keys = positions.unsqueeze(0) < valid_lens.unsqueeze(1)
-        attention_mask = (
-            causal.view(1, 1, seq_len, seq_len)
-            & valid_keys.view(batch, 1, 1, seq_len)
-        )
+        attention_mask = causal.view(1, 1, seq_len, seq_len) & valid_keys.view(batch, 1, 1, seq_len)
         output = F.scaled_dot_product_attention(
             q,
             k,
@@ -474,8 +538,8 @@ class CausalSelfAttention(nn.Module):
     def step(
         self,
         x: torch.Tensor,
-        cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        cache: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         q, k, v = self._project(x)
         if cache is not None:
             k = torch.cat((cache[0], k), dim=2)
@@ -511,8 +575,8 @@ class TransformerBlock(nn.Module):
     def step(
         self,
         x: torch.Tensor,
-        cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        cache: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attention, cache = self.attention.step(x, cache)
         x = self.norm1(x + attention)
         return self.norm2(x + self.ffn(x)), cache
@@ -557,9 +621,7 @@ class MiniGPT(nn.Module):
     ) -> torch.Tensor:
         seq_len = token_ids.shape[1]
         if seq_len > self.max_seq_len:
-            raise ValueError(
-                f"Input length {seq_len} exceeds model limit {self.max_seq_len}."
-            )
+            raise ValueError(f"Input length {seq_len} exceeds model limit {self.max_seq_len}.")
         positions = torch.arange(seq_len, device=token_ids.device)
         x = self.token_embedding(token_ids) + self.position_embedding(positions)
         x = self.embedding_dropout(x)
@@ -574,16 +636,16 @@ class MiniGPT(nn.Module):
         stop_id: int,
         temperature: float,
         top_k: int,
-        max_new_tokens: Optional[int] = None,
-    ) -> List[int]:
+        max_new_tokens: int | None = None,
+    ) -> list[int]:
+        """Generate token IDs autoregressively from a non-empty prompt."""
+
         if not prompt_ids:
             raise ValueError("The prompt must contain at least one token.")
-        if temperature <= 0:
+        if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be positive.")
         if not 1 <= top_k <= self.output.out_features:
-            raise ValueError(
-                f"top_k must be between 1 and {self.output.out_features}."
-            )
+            raise ValueError(f"top_k must be between 1 and {self.output.out_features}.")
         if len(prompt_ids) > self.max_seq_len:
             raise ValueError("The prompt is longer than MINIBPE_SEQ_LEN.")
         if max_new_tokens is not None and max_new_tokens < 1:
@@ -591,9 +653,7 @@ class MiniGPT(nn.Module):
 
         self.eval()
         device = self.token_embedding.weight.device
-        caches: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
-            None for _ in self.blocks
-        ]
+        caches: list[tuple[torch.Tensor, torch.Tensor] | None] = [None for _ in self.blocks]
         generated = list(prompt_ids)
         logits = None
 
@@ -638,6 +698,11 @@ class MiniGPT(nn.Module):
         return generated
 
 
+# =============================================================================
+# Training
+# =============================================================================
+
+
 def masked_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -649,10 +714,7 @@ def masked_cross_entropy(
         targets.reshape(batch * seq_len),
         reduction="none",
     ).view(batch, seq_len)
-    mask = (
-        torch.arange(seq_len, device=logits.device).unsqueeze(0)
-        < valid_lens.unsqueeze(1)
-    )
+    mask = torch.arange(seq_len, device=logits.device).unsqueeze(0) < valid_lens.unsqueeze(1)
     return (losses * mask).sum() / mask.sum()
 
 
@@ -716,10 +778,14 @@ def create_training_components(
     return optimizer, scheduler, scaler
 
 
-def capture_rng_state(batch_generator: torch.Generator) -> Dict[str, Any]:
-    state: Dict[str, Any] = {
+def capture_rng_state(
+    train_generator: torch.Generator,
+    eval_generator: torch.Generator,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
         "torch": torch.get_rng_state(),
-        "batch_generator": batch_generator.get_state(),
+        "train_generator": train_generator.get_state(),
+        "eval_generator": eval_generator.get_state(),
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
@@ -733,13 +799,18 @@ def capture_rng_state(batch_generator: torch.Generator) -> Dict[str, Any]:
 
 
 def restore_rng_state(
-    state: Dict[str, Any],
-    batch_generator: torch.Generator,
+    state: dict[str, Any],
+    train_generator: torch.Generator,
+    eval_generator: torch.Generator,
 ) -> None:
     if "torch" in state:
         torch.set_rng_state(state["torch"])
-    if "batch_generator" in state:
-        batch_generator.set_state(state["batch_generator"])
+    if "train_generator" in state:
+        train_generator.set_state(state["train_generator"])
+    elif "batch_generator" in state:
+        train_generator.set_state(state["batch_generator"])
+    if "eval_generator" in state:
+        eval_generator.set_state(state["eval_generator"])
     if "cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
     if (
@@ -749,6 +820,11 @@ def restore_rng_state(
         and hasattr(torch.mps, "set_rng_state")
     ):
         torch.mps.set_rng_state(state["mps"])
+
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
 
 
 def save_checkpoint(
@@ -762,8 +838,11 @@ def save_checkpoint(
     step: int,
     training_losses: Sequence[float],
     validation_losses: Sequence[float],
-    batch_generator: torch.Generator,
+    train_generator: torch.Generator,
+    eval_generator: torch.Generator,
 ) -> None:
+    """Atomically save all state required to resume training."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     payload = {
@@ -771,20 +850,23 @@ def save_checkpoint(
         "step": step,
         "config": config.to_dict(),
         "tokenizer": tokenizer.to_dict(),
+        "tokenizer_merges": tokenizer.merges,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "training_losses": list(training_losses),
         "validation_losses": list(validation_losses),
-        "rng_state": capture_rng_state(batch_generator),
+        "rng_state": capture_rng_state(train_generator, eval_generator),
     }
     torch.save(payload, temporary_path)
     temporary_path.replace(path)
     print(f"Checkpoint saved: {path} (step {step})")
 
 
-def load_checkpoint(path: Path) -> Dict[str, Any]:
+def load_checkpoint(path: Path) -> dict[str, Any]:
+    """Load and validate a training checkpoint."""
+
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
@@ -805,11 +887,14 @@ def load_checkpoint(path: Path) -> Dict[str, Any]:
 
 
 def model_from_checkpoint(
-    checkpoint: Dict[str, Any],
+    checkpoint: dict[str, Any],
     device: torch.device,
-) -> Tuple[MiniGPT, BPETokenizer, Config]:
+) -> tuple[MiniGPT, BPETokenizer, Config]:
     config = Config.from_dict(checkpoint["config"])
-    tokenizer = BPETokenizer.from_dict(checkpoint["tokenizer"])
+    tokenizer = BPETokenizer.from_dict(
+        checkpoint["tokenizer"],
+        checkpoint.get("tokenizer_merges"),
+    )
     model = MiniGPT(config, tokenizer.vocab_size).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model, tokenizer, config
@@ -822,18 +907,21 @@ def train_model(
     validation_data: EncodedDataset,
     config: Config,
     device: torch.device,
-    checkpoint_path: Optional[Path] = None,
+    checkpoint_path: Path | None = None,
     checkpoint_interval: int = 1000,
-    resume_state: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[float], List[float]]:
+    resume_state: dict[str, Any] | None = None,
+) -> tuple[list[float], list[float]]:
+    """Train a model and optionally write resumable checkpoints."""
+
     optimizer, scheduler, scaler = create_training_components(
         model,
         config,
         device,
     )
-    generator = torch.Generator().manual_seed(config.seed)
-    training_losses: List[float] = []
-    validation_losses: List[float] = []
+    train_generator = torch.Generator().manual_seed(config.seed)
+    eval_generator = torch.Generator().manual_seed(config.seed + 1)
+    training_losses: list[float] = []
+    validation_losses: list[float] = []
     start_step = 0
 
     if checkpoint_interval < 1:
@@ -848,8 +936,7 @@ def train_model(
         missing = sorted(resumable_fields - resume_state.keys())
         if missing:
             raise ValueError(
-                "Checkpoint cannot resume training; missing fields: "
-                + ", ".join(missing)
+                "Checkpoint cannot resume training; missing fields: " + ", ".join(missing)
             )
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
         scaler.load_state_dict(resume_state["scaler_state_dict"])
@@ -871,7 +958,11 @@ def train_model(
             )
         training_losses = list(resume_state.get("training_losses", []))
         validation_losses = list(resume_state.get("validation_losses", []))
-        restore_rng_state(resume_state["rng_state"], generator)
+        restore_rng_state(
+            resume_state["rng_state"],
+            train_generator,
+            eval_generator,
+        )
         print(f"Resuming from step {start_step}")
 
     forward_model = model
@@ -886,7 +977,7 @@ def train_model(
         inputs, targets, valid_lens = sample_batch(
             train_data,
             config.batch_size,
-            generator,
+            train_generator,
             device,
         )
 
@@ -902,16 +993,14 @@ def train_model(
         training_losses.append(loss.item())
 
         should_evaluate = (
-            step == 0
-            or (step + 1) % config.eval_interval == 0
-            or step + 1 == config.max_steps
+            step == 0 or (step + 1) % config.eval_interval == 0 or step + 1 == config.max_steps
         )
         if should_evaluate:
             validation_loss = estimate_loss(
                 forward_model,
                 validation_data,
                 config,
-                generator,
+                eval_generator,
                 device,
             )
             validation_losses.append(validation_loss)
@@ -922,10 +1011,7 @@ def train_model(
             )
 
         completed_step = step + 1
-        if (
-            checkpoint_path is not None
-            and completed_step % checkpoint_interval == 0
-        ):
+        if checkpoint_path is not None and completed_step % checkpoint_interval == 0:
             save_checkpoint(
                 checkpoint_path,
                 model,
@@ -937,7 +1023,8 @@ def train_model(
                 completed_step,
                 training_losses,
                 validation_losses,
-                generator,
+                train_generator,
+                eval_generator,
             )
             last_saved_step = completed_step
 
@@ -953,10 +1040,16 @@ def train_model(
             config.max_steps,
             training_losses,
             validation_losses,
-            generator,
+            train_generator,
+            eval_generator,
         )
 
     return training_losses, validation_losses
+
+
+# =============================================================================
+# Evaluation and generation
+# =============================================================================
 
 
 @torch.inference_mode()
@@ -995,7 +1088,7 @@ def dataset_metrics(
     dataset: EncodedDataset,
     batch_size: int,
     device: torch.device,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     model.eval()
     total_nll = 0.0
     total_tokens = 0
@@ -1016,10 +1109,7 @@ def dataset_metrics(
                 targets.reshape(batch * seq_len),
                 reduction="none",
             ).view(batch, seq_len)
-            mask = (
-                torch.arange(seq_len, device=device).unsqueeze(0)
-                < valid_lens.unsqueeze(1)
-            )
+            mask = torch.arange(seq_len, device=device).unsqueeze(0) < valid_lens.unsqueeze(1)
             total_nll += (losses * mask).sum().item()
             total_tokens += mask.sum().item()
 
@@ -1027,6 +1117,11 @@ def dataset_metrics(
         raise ValueError("The evaluation dataset contains no usable tokens.")
     average_loss = total_nll / total_tokens
     return average_loss, math.exp(average_loss)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 CONFIG_ARGUMENTS = {
@@ -1044,6 +1139,7 @@ CONFIG_ARGUMENTS = {
     "learning_rate": ("--learning-rate", float),
     "dropout": ("--dropout", float),
     "max_token_length": ("--max-token-length", int),
+    "seed": ("--seed", int),
 }
 
 
@@ -1058,7 +1154,7 @@ def add_device_argument(parser: argparse.ArgumentParser) -> None:
 
 def add_config_arguments(
     parser: argparse.ArgumentParser,
-    fields: Optional[Sequence[str]] = None,
+    fields: Sequence[str] | None = None,
 ) -> None:
     selected = fields or tuple(CONFIG_ARGUMENTS)
     for field in selected:
@@ -1094,7 +1190,10 @@ def config_with_cli_overrides(
 
 
 def initialize_runtime(seed: int, requested_device: str) -> torch.device:
+    random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.set_float32_matmul_precision("high")
     device = choose_device(requested_device)
     print(f"Device: {device}")
@@ -1103,9 +1202,8 @@ def initialize_runtime(seed: int, requested_device: str) -> torch.device:
 
 def run_train(args: argparse.Namespace) -> None:
     config = config_with_cli_overrides(Config.from_env(), args)
-    device = initialize_runtime(config.seed, args.device)
-
     train_samples, validation_samples = load_data(config.data_file)
+    device = initialize_runtime(config.seed, args.device)
     tokenizer = BPETokenizer.train(
         train_samples,
         config.vocab_size,
@@ -1151,7 +1249,10 @@ def run_resume(args: argparse.Namespace) -> None:
         )
 
     device = initialize_runtime(config.seed, args.device)
-    tokenizer = BPETokenizer.from_dict(checkpoint["tokenizer"])
+    tokenizer = BPETokenizer.from_dict(
+        checkpoint["tokenizer"],
+        checkpoint.get("tokenizer_merges"),
+    )
     train_samples, validation_samples = load_data(config.data_file)
     train_data = encode_dataset(
         train_samples,
@@ -1320,12 +1421,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         args.handler(args)
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
 
 
