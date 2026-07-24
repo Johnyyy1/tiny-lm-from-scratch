@@ -1,739 +1,784 @@
+import heapq
 import math
 import os
+from collections import defaultdict
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
-data_file = Path(
-    os.environ.get("MINIBPE_DATA_FILE", "/Users/jonas/Downloads/training_data.txt")
-)
-if not data_file.is_file():
-    raise FileNotFoundError(
-        f"Training data not found at {data_file}. "
-        "Set MINIBPE_DATA_FILE to a UTF-8 text file with one sample per line."
-    )
+STOP_TOKEN = "^"
 
-with data_file.open(encoding="utf-8") as handle:
-    data = [line.rstrip("\n") for line in handle]
 
-if len(data) < 2:
-    raise ValueError("Training data must contain at least two lines.")
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
 
-split_index = max(1, min(len(data) - 1, int(len(data) * 0.9)))
-data_trn = data[:split_index]
-data_val = data[split_index:]
 
-# Get the unique characters across the training set
-unique_chars = set()
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number.") from exc
 
-for story in data_trn:
-    unique_chars.update(set(story))
 
-unique_chars = ''.join(sorted(unique_chars))
+@dataclass(frozen=True)
+class Config:
+    data_file: Path
+    vocab_size: int
+    seq_len: int
+    d_model: int
+    num_heads: int
+    d_ff: int
+    num_layers: int
+    batch_size: int
+    max_steps: int
+    eval_interval: int
+    eval_batches: int
+    learning_rate: float
+    dropout: float
+    max_token_length: int
+    compile_model: bool
+    seed: int = 42
 
-# We use '^' as a special start character in the model
-assert '^' not in unique_chars
+    @classmethod
+    def from_env(cls) -> "Config":
+        config = cls(
+            data_file=Path(
+                os.environ.get(
+                    "MINIBPE_DATA_FILE",
+                    "/Users/jonas/Downloads/training_data.txt",
+                )
+            ),
+            vocab_size=env_int("MINIBPE_VOCAB_SIZE", 5000),
+            seq_len=env_int("MINIBPE_SEQ_LEN", 512),
+            d_model=env_int("MINIBPE_D_MODEL", 1024),
+            num_heads=env_int("MINIBPE_NUM_HEADS", 8),
+            d_ff=env_int("MINIBPE_D_FF", 2048),
+            num_layers=env_int("MINIBPE_NUM_LAYERS", 2),
+            batch_size=env_int("MINIBPE_BATCH_SIZE", 16),
+            max_steps=env_int("MINIBPE_MAX_STEPS", 200000),
+            eval_interval=env_int("MINIBPE_EVAL_INTERVAL", 100),
+            eval_batches=env_int("MINIBPE_EVAL_BATCHES", 4),
+            learning_rate=env_float("MINIBPE_LEARNING_RATE", 3e-4),
+            dropout=env_float("MINIBPE_DROPOUT", 0.1),
+            max_token_length=env_int("MINIBPE_MAX_TOKEN_LENGTH", 40),
+            compile_model=os.environ.get("MINIBPE_COMPILE", "0") == "1",
+        )
+        config.validate()
+        return config
 
-stop_char = '^'
+    def validate(self) -> None:
+        positive_values = {
+            "MINIBPE_VOCAB_SIZE": self.vocab_size,
+            "MINIBPE_SEQ_LEN": self.seq_len,
+            "MINIBPE_D_MODEL": self.d_model,
+            "MINIBPE_NUM_HEADS": self.num_heads,
+            "MINIBPE_D_FF": self.d_ff,
+            "MINIBPE_NUM_LAYERS": self.num_layers,
+            "MINIBPE_BATCH_SIZE": self.batch_size,
+            "MINIBPE_EVAL_INTERVAL": self.eval_interval,
+            "MINIBPE_EVAL_BATCHES": self.eval_batches,
+            "MINIBPE_MAX_TOKEN_LENGTH": self.max_token_length,
+        }
+        for name, value in positive_values.items():
+            if value < 1:
+                raise ValueError(f"{name} must be positive.")
+        if self.max_steps < 0:
+            raise ValueError("MINIBPE_MAX_STEPS cannot be negative.")
+        if self.d_model % self.num_heads:
+            raise ValueError("MINIBPE_NUM_HEADS must divide MINIBPE_D_MODEL.")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("MINIBPE_DROPOUT must be in the range [0, 1).")
+        if self.learning_rate <= 0:
+            raise ValueError("MINIBPE_LEARNING_RATE must be positive.")
 
-# Add stop character to each string
-data_trn[:] = [s + "^" for s in data_trn]
-data_val[:] = [s + "^" for s in data_val]
 
-stoi = {s:i+1 for i, s in enumerate(unique_chars)}
-stoi[stop_char] = 0
-itos = {i:s for s, i in stoi.items()}
+def load_data(path: Path) -> Tuple[List[str], List[str]]:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Training data not found at {path}. "
+            "Set MINIBPE_DATA_FILE to a UTF-8 text file with one sample per line."
+        )
 
-print(f"Initial vocabulary size (pre-BPE): {len(stoi)}")
+    with path.open(encoding="utf-8") as handle:
+        data = [line.rstrip("\n") for line in handle]
 
-# initial tokens are from the raw data
-cur_tokens = []
-nr_trn = len(data_trn)
+    if len(data) < 2:
+        raise ValueError("Training data must contain at least two lines.")
+    if any(STOP_TOKEN in sample for sample in data):
+        raise ValueError(f"Training samples cannot contain the reserved token {STOP_TOKEN!r}.")
 
-# Tokenization loop
+    split_index = max(1, min(len(data) - 1, int(len(data) * 0.9)))
+    return data[:split_index], data[split_index:]
 
-for s in data_trn[:nr_trn]:
-    cur_tokens += list(s)
 
-init_token_count = len(cur_tokens)
-nr_actual_tokens = len(stoi)
+class BPETokenizer:
+    """Greedy BPE tokenizer with incremental pair-frequency training."""
 
-# This is pretty arbitrary - I set another limit below to stop when the
-# token length exceeds 40 characters (determined empirically)
-nr_desired_tokens = int(os.environ.get("MINIBPE_VOCAB_SIZE", "5000"))
-if nr_desired_tokens < len(stoi):
-    raise ValueError(
-        f"MINIBPE_VOCAB_SIZE must be at least the initial vocabulary size ({len(stoi)})."
-    )
+    _TOKEN_ID = object()
 
-print(f"Initial token count: {init_token_count}")
+    def __init__(self, token_to_id: Dict[str, int]):
+        self.token_to_id = token_to_id
+        self.id_to_token = {token_id: token for token, token_id in token_to_id.items()}
+        self.stop_id = token_to_id[STOP_TOKEN]
+        self._trie: Dict[object, object] = {}
 
-while nr_actual_tokens < nr_desired_tokens:
-    new_tokens = []
-    counts = {}
-    candidates = {}
+        for token, token_id in token_to_id.items():
+            node = self._trie
+            for char in token:
+                node = node.setdefault(char, {})
+            node[self._TOKEN_ID] = token_id
 
-    for i in range(len(cur_tokens)):
-        if i == len(cur_tokens) - 1:
-            break
+    @property
+    def vocab_size(self) -> int:
+        return len(self.token_to_id)
 
-        left = cur_tokens[i]
-        right = cur_tokens[i+1]
+    @classmethod
+    def train(
+        cls,
+        samples: Sequence[str],
+        target_vocab_size: int,
+        max_token_length: int,
+    ) -> "BPETokenizer":
+        characters = sorted({char for sample in samples for char in sample})
+        token_to_id = {char: index + 1 for index, char in enumerate(characters)}
+        token_to_id[STOP_TOKEN] = 0
+        id_to_token = {token_id: token for token, token_id in token_to_id.items()}
 
-        # Prevent merging on the stop_char so it is easier to deliminate
-        # each sample from the dataset
-        if left == stop_char or right == stop_char:
-            continue
-
-        tok = left + right
-
-        if tok not in counts:
-            counts[tok] = 1
-            candidates[tok] = {}
-            candidates[tok]["left"] = left
-            candidates[tok]["right"] = right
-        else:
-            counts[tok] += 1
-
-    if not counts:
-        print("No mergeable token pairs remain (stopping)")
-        break
-
-    # Need the key which has max count
-    new_token = max(counts, key=counts.get)
-    left = candidates[new_token]['left']
-    right = candidates[new_token]['right']
-    cursor = 0
-
-    for i in range(len(cur_tokens)):
-        if i == 0:
-            continue
-
-        # Check for merge condition
-        #
-        # We merge if the left and right tokens match, and the cursor is not i.
-        # If cursor is i, it means we just merged, and could merge again (two matches
-        # in a row), but merges are non-overlapping, so we just skip over, keeping
-        # cursor where it is.
-        if cur_tokens[i-1] == left and cur_tokens[i] == right and cursor != i:
-            if cursor < i - 1:
-                # Cursor is behind the left token, so copy [cursor, left token)
-                new_tokens += cur_tokens[cursor:i-1] + [new_token]
-            else:
-                new_tokens += [new_token]
-
-            # anytime we merge, we move the cursor to the right of the right-merge token
-            cursor = i + 1
-
-    # Grab the end. this also cleanly covers the degenerate case where no merges happened
-    if cursor <= len(cur_tokens) - 1:
-        new_tokens += cur_tokens[cursor:]
-
-    cur_tokens = new_tokens
-    new_len = len(cur_tokens)
-
-    # A string can be produced by more than one merge path. Reuse its existing
-    # id rather than overwriting the forward map with a second id.
-    if new_token not in stoi:
-        stoi[new_token] = nr_actual_tokens
-        itos[nr_actual_tokens] = new_token
-        nr_actual_tokens += 1
-
-    print(f"Merged {new_token}")
-
-    if nr_actual_tokens % 1000 == 0:
-        print(f"Tokens: {nr_actual_tokens} ({(init_token_count - new_len) / init_token_count:.2f}% reduction)")
-
-    if len(new_token) > 40:
-        print(f"Max token length is {len(new_token)}: {new_token}   (stopping)")
-        print(f"Number of tokens: {nr_actual_tokens}")
-        break
-
-print(f"Vocab size (post-BPE): {len(stoi)}")
-
-def tokenize_string(s, sorted_stoi):
-    tokens = []
-    cursor = 0
-
-    while cursor < len(s):
-        for k in sorted_stoi:
-            if s[cursor:].startswith(k):
-                tokens.append(k)
-                cursor += len(k)
-                break
-        else:
+        if target_vocab_size < len(token_to_id):
             raise ValueError(
-                f"No vocabulary token matches character {s[cursor]!r} "
-                f"at position {cursor}."
+                "MINIBPE_VOCAB_SIZE must be at least the initial vocabulary "
+                f"size ({len(token_to_id)})."
             )
 
-    return tokens
-
-sorted_stoi = {k : stoi[k] for k in sorted(stoi, key=len, reverse=True)}
-
-# We have the tokenization map stoi. Now we need to tokenize the training and validation sets
-trn_stories = data_trn
-val_stories = data_val
-
-trn_tokenized = []
-val_tokenized = []
-
-for s in trn_stories:
-    tokens = tokenize_string(s, sorted_stoi)
-    trn_tokenized.append(tokens)
-
-for s in val_stories:
-    tokens = tokenize_string(s, sorted_stoi)
-    val_tokenized.append(tokens)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-device
-
-# Create tokenized training and validation samples
-# Note I dropped the sequence length down from 1024
-# to 512 because the vast majority of tokenized stories
-# are less than ~500 tokens
-seq_len = int(os.environ.get("MINIBPE_SEQ_LEN", "512"))
-if seq_len < 1:
-    raise ValueError("MINIBPE_SEQ_LEN must be positive.")
-
-trn_tokenized = [s for s in trn_tokenized if len(s) <= seq_len]
-val_tokenized = [s for s in val_tokenized if len(s) <= seq_len]
-if not trn_tokenized:
-    raise ValueError("No training samples fit within MINIBPE_SEQ_LEN.")
-if not val_tokenized:
-    raise ValueError("No validation samples fit within MINIBPE_SEQ_LEN.")
-trn_tokenized_lens = []
-val_tokenized_lens = []
-
-pads = []
-for s in trn_tokenized:
-    trn_tokenized_lens.append(len(s))
-
-    if seq_len == len(s):
-        pads.append([])
-    else:
-        pads.append([stop_char] * (seq_len - len(s)))
-
-trn_tokenized = [s+p for s, p in zip(trn_tokenized, pads)]
-
-pads = []
-for s in val_tokenized:
-    val_tokenized_lens.append(len(s))
-
-    if seq_len == len(s):
-        pads.append([])
-    else:
-        pads.append([stop_char] * (seq_len - len(s)))
-
-val_tokenized = [s+p for s, p in zip(val_tokenized, pads)]
-
-for s, l in zip(trn_tokenized, trn_tokenized_lens):
-    assert len(s) == seq_len
-    assert l <= len(s)
-
-for s, l in zip(val_tokenized, val_tokenized_lens):
-    assert len(s) == seq_len
-    assert l <= len(s)
-
-def get_batch(indices, tokenized_data, device):
-    X, Y = [], []
-
-    for i in indices:
-        token_list = tokenized_data[i]
-
-        x = [stoi[t] for t in token_list]
-        y = [stoi[t] for t in token_list[1:] + [stop_char]]
-
-        X.append(x)
-        Y.append(y)
-
-    X = torch.tensor(X, device=device)
-    Y = torch.tensor(Y, device=device)
-
-    return X, Y
-
-trn_valid_lens = torch.tensor(trn_tokenized_lens, device=device)
-val_valid_lens = torch.tensor(val_tokenized_lens, device=device)
-
-trn_valid_lens.shape, val_valid_lens.shape
-
-def check_tensors(tensor, name):
-    if torch.isnan(tensor).any():
-        raise ValueError(f"NaN detected in {name}")
-    if torch.isinf(tensor).any():
-        raise ValueError(f"Inf detected in {name}")
-
-    import torch.nn.functional as F
-
-class Embedding():
-    def __init__(self, vocab_size, embed_dim, g, device):
-        self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.emb = torch.randn(self.vocab_size, self.embed_dim, generator=g, device=device)
-
-    # X is (batch, seq_len)
-    def __call__(self, X):
-
-        # returns (batch, seq_len, embed_dim)
-        out = F.embedding(X, self.emb)
-        check_tensors(out, "embedding")
-
-        return out
-
-    def params(self):
-        return [self.emb]
-
-class MultiHeadSelfAttn():
-    def __init__(self, d_model, nr_heads, g, device):
-        if nr_heads < 1 or d_model % nr_heads != 0:
-            raise ValueError("nr_heads must be positive and divide d_model evenly.")
-        self.device = device
-        self.d_model = d_model
-        self.nr_heads = nr_heads
-        self.hidden_dim = d_model // nr_heads
-        self.mh_proj = torch.nn.init.kaiming_normal_(torch.randn(nr_heads, 3, d_model, self.hidden_dim, generator=g, device=device), nonlinearity='relu')
-        self.Wo = torch.nn.init.kaiming_normal_(torch.randn(d_model, d_model, generator=g, device=device), nonlinearity='relu')
-        self.attn = None
-
-    # X is (batch, seq_len, d_model)
-    # valid_lens is (batch)
-    def __call__(self, X, valid_lens):
-        assert X.dim() == 3
-        seq_len = X.shape[1]
-
-        # (batch, 1, 1, seq_len, d_model)
-        X = X.unsqueeze(dim=1).unsqueeze(dim=1)
-
-        # (batch, nr_heads, 3, seq_len, d_model)
-        X = X.expand(-1, self.nr_heads, 3, -1, -1)
-
-        # (batch, 1, 1)
-        valid_lens = valid_lens.unsqueeze(dim=-1).unsqueeze(dim=-1)
-
-        # (batch, nr_heads, 1)
-        valid_lens = valid_lens.expand(-1, self.nr_heads, -1)
-        valid_lens = valid_lens.reshape(-1, 1)
-
-        # (batch, nr_heads, 3, d_model, hidden_dim)
-        mh_proj = self.mh_proj.unsqueeze(dim=0).expand(X.shape[0], -1, -1, -1, -1)
-
-        # flatten outer dims for batched multiply: (batch*nr_heads*3, _, _)
-        # Since this is self attention, the input is reused across each
-        # head's linear projection matrix (each head attends to the same input).
-        X = X.reshape(-1, seq_len, self.d_model)
-        mh_proj = mh_proj.reshape(-1, self.d_model, self.hidden_dim)
-
-        # (batch*nr_heads*3, seq_len, hidden_dim)
-        X = torch.bmm(X, mh_proj)
-        check_tensors(X, "mhattn_first_bmm")
-
-        X = X.reshape(-1, self.nr_heads, 3, seq_len, self.hidden_dim)
-
-        # Pluck out Q, K, V
-        Q = X[:, :, 0, :, :]
-        K = X[:, :, 1, :, :]
-        V = X[:, :, 2, :, :]
-
-        Q = Q.reshape(-1, seq_len, self.hidden_dim)
-
-        KT = K.transpose(2, 3)
-        KT = KT.reshape(-1, self.hidden_dim, seq_len)
-
-        # (batch*nr_heads, seq_len, seq_len)
-        check_tensors(Q, "mhattn_Q")
-        check_tensors(KT, "mhattn_KT")
-
-        scaled_dp = torch.bmm(Q, KT) / math.sqrt(self.hidden_dim)
-        check_tensors(scaled_dp, "mhattn_scaled_dp")
-
-        # (batch*nr_heads, seq_len, seq_len)
-        attn = self.masked_softmax(scaled_dp, valid_lens, self.device)
-        self.attn = attn
-        check_tensors(attn, "mhattn_masked_attn")
-        V = V.reshape(-1, seq_len, self.hidden_dim)
-
-        out = torch.bmm(attn, V)
-        check_tensors(out, "mhattn_third_bmm")
-        out = out.reshape(-1, self.nr_heads, seq_len, self.hidden_dim)
-
-        # gives us tuple of nr_heads tensors, each with shape (batch, seq_len, hidden_dim)
-        out = out.unbind(dim=1)
-
-        # (batch, seq_len, hidden_dim * nr_heads) = (batch, seq_len, d_model)
-        out = torch.cat(out, dim=-1)
-
-        # Final linear projection (batch, seq_len, d_model)
-        return out @ self.Wo
-
-    def params(self):
-        return [self.mh_proj, self.Wo]
-
-    # X is (batch*nr_heads, seq_len, seq_len)
-    # valid_lens is (batch*nr_heads, 1). Each entry should be <= seq_len
-    def masked_softmax(self, X, valid_lens, device):
-        assert X.dim() == 3
-        assert valid_lens.dim() == 2
-
-        seq_len = X.shape[1]
-        assert torch.all(valid_lens <= seq_len)
-
-        # (1, 1, seq_len) -> ranging from 0 to seq_len - 1
-        idxs = torch.arange(0, seq_len, device=device).unsqueeze(dim=0).unsqueeze(dim=0)
-
-        # (batch*nr_heads, seq_len, seq_len)
-        idxs = idxs.expand(X.shape[0], seq_len, -1)
-
-        # (batch*nr_heads, 1, 1)
-        valid_lens = valid_lens.unsqueeze(dim=-1)
-
-        # (batch*nr_heads, seq_len, seq_len)
-        valid_lens = valid_lens.expand(X.shape[0], seq_len, seq_len)
-
-        mask = (idxs < valid_lens).float()
-        idxs = idxs.transpose(1, 2)
-        mask = mask * (idxs < valid_lens).float()
-
-        # Now we create per-token mask. Since we are doing autoregression,
-        # we have to ensure that token at position i can not look ahead
-        # at any tokens after i. The first token only has itself. The second
-        # token has itself and the first token, and so on.
-        valid_lens = idxs + 1
-        idxs = idxs.transpose(1, 2)
-
-        # take intersection of padding and token masks
-        tok_mask = (idxs < valid_lens).float()
-        mask = tok_mask * mask
-
-        # invert mask so we can add large negative value to cleared indices
-        X = X.masked_fill(~(mask.bool()), float('-inf'))
-
-        # Get attn/probs over the last dimension
-        result = F.softmax(X, dim=-1)
-        return torch.nan_to_num(result, nan=0.0)
-
-class LayerNorm():
-    def __init__(self, d_model, device):
-        self.gain = torch.ones(d_model, device=device)
-        self.bias = torch.zeros(d_model, device=device)
-
-    # X is (batch, seq_len, d_model)
-    def __call__(self, X):
-        assert X.dim() == 3
-
-        # (batch, seq_len, 1)
-        mean = torch.mean(X, dim=2, keepdim=True)
-
-        # (batch, seq_len, 1)
-        std = torch.sqrt(torch.mean((X - mean)**2, dim=2, keepdim=True) + 1e-5)
-        check_tensors(std, "layer_norm_std")
-
-        # (batch, seq_len, d_model)
-        return self.gain / std * (X - mean) + self.bias
-
-    def params(self):
-        return [self.gain, self.bias]
-
-class PositionalEncoding():
-    def __init__(self, max_seq_len, d_model, g, device):
-        self.device = device
-        self.emb = torch.randn(max_seq_len, d_model, generator=g, device=device)
-
-    # X is (batch, seq_len, d_model)
-    def __call__(self, x):
-        seq_len = x.shape[1]
-        assert seq_len <= self.emb.shape[0]
-        indices = torch.arange(0, seq_len, device=self.device)
-        pe = F.embedding(indices, self.emb)
-        check_tensors(pe, "pe")
-
-        return x + pe
-
-    def params(self):
-        return [self.emb]
-
-class FFN():
-    def __init__(self, d_model, d_ff, g, device):
-        self.W_i = torch.nn.init.kaiming_normal_(torch.randn(d_model, d_ff, generator=g, device=device), nonlinearity='relu')
-        self.W_o = torch.randn(d_ff, d_model, generator=g, device=device)
-        self.b_i = torch.zeros(d_ff, device=device)
-        self.b_o = torch.zeros(d_model, device=device)
-
-    # X is (batch, seq_len, d_model)
-    def __call__(self, X):
-        # (batch, seq_len, d_ff)
-        X = torch.relu(X @ self.W_i + self.b_i)
-
-        # (batch, seq_len, d_model)
-        return X @ self.W_o + self.b_o
-
-    def params(self):
-        return [self.W_i, self.W_o, self.b_i, self.b_o]
-
-class Linear():
-    def __init__(self, d_model, vocab_size, g, device):
-        self.W = torch.randn(d_model, vocab_size, generator=g, device=device) * 0.1 # make initial logits less confident
-        self.b = torch.zeros(vocab_size, device=device)
-
-    # X is (batch, seq_len, d_model)
-    def __call__(self, X):
-        # (batch, seq_len, vocab_size)
-        return X @ self.W + self.b
-
-    def params(self):
-        return [self.W, self.b]
-
-class TransformerBlock():
-    def __init__(self, d_model, d_ff, nr_heads, g, device):
-        self.mh_attn = MultiHeadSelfAttn(d_model, nr_heads, g, device)
-        self.layer_norm1 = LayerNorm(d_model, device)
-        self.ffn = FFN(d_model, d_ff, g, device)
-        self.layer_norm2 = LayerNorm(d_model, device)
-        self.device = device
-        self.g = g
-        self.attn = None
-
-    # X is (batch, seq_len, d_model)
-    # X is the output of the sum between the embedding and positional encoding
-    #
-    # valid_lens is (batch)
-    def __call__(self, X, valid_lens, dropout_prob):
-        dropout = Dropout(self.g, self.device)
-
-        res = X
-        X = dropout(X, dropout_prob)
-        X = self.mh_attn(X, valid_lens)
-        X = dropout(X, dropout_prob)
-        X = X + res
-        X = dropout(X, dropout_prob)
-        X = self.layer_norm1(X)
-
-        res = X
-        X = self.ffn(X)
-        X = X + res
-        X = dropout(X, dropout_prob)
-        X = self.layer_norm2(X)
-        self.attn = self.mh_attn.attn
-
-        return X
-
-    def params(self):
-        return self.mh_attn.params() + self.layer_norm1.params() + self.ffn.params() + self.layer_norm2.params()
-
-class Dropout():
-    def __init__(self, g, device):
-        self.generator = g
-        self.device = device
-
-    def __call__(self, x, dropout_prob):
-        if not 0 <= dropout_prob < 1:
-            raise ValueError("dropout_prob must be in the range [0, 1).")
-        if dropout_prob == 0:
-            return x
-
-        mask = (torch.rand(x.shape, generator=self.generator, device=self.device) > dropout_prob).float()
-
-        return x * mask / (1 - dropout_prob)
-
-    def params(self):
-        return []
-
-vocab_size = len(stoi)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-g = torch.Generator(device=device).manual_seed(42)
-d_model = int(os.environ.get("MINIBPE_D_MODEL", "1024"))
-nr_heads = int(os.environ.get("MINIBPE_NUM_HEADS", "8"))
-d_ff = int(os.environ.get("MINIBPE_D_FF", "2048"))
-device
-
-import torch.optim as optim
-import torch.optim.lr_scheduler as lrs
-
-model = [
-    Embedding(vocab_size, d_model, g, device),
-    PositionalEncoding(seq_len, d_model, g, device),
-    TransformerBlock(d_model, d_ff, nr_heads, g, device), # call requires valid_lens
-    TransformerBlock(d_model, d_ff, nr_heads, g, device),
-    Linear(d_model, vocab_size, g, device)
-]
-
-
-def forward_model(model, token_ids, valid_lens, dropout_prob=0.0):
-    x = token_ids
-    for layer in model:
-        if isinstance(layer, TransformerBlock):
-            x = layer(x, valid_lens, dropout_prob)
-        else:
-            x = layer(x)
-    return x
-
-
-params = [p for layer in model for p in layer.params()]
-
-for p in params:
-    p.requires_grad = True
-
-print(f"Transformer has {sum([p.nelement() for p in params])} params")
-
-batch_size = int(os.environ.get("MINIBPE_BATCH_SIZE", "64"))
-max_step = int(os.environ.get("MINIBPE_MAX_STEPS", "200000"))
-if batch_size < 1:
-    raise ValueError("MINIBPE_BATCH_SIZE must be positive.")
-if max_step < 0:
-    raise ValueError("MINIBPE_MAX_STEPS cannot be negative.")
-cosine_start = max_step * 2 // 100
-lr = 3e-4
-dropout_prob = 0.1
-
-optimizer = optim.Adam(params, lr)
-if max_step > 0:
-    warmup_steps = max(1, cosine_start)
-
-    def lr_factor(step):
-        if step < warmup_steps:
-            progress = step / warmup_steps
-            return (1 / 1000) + (1 - 1 / 1000) * progress
-
-        progress = (step - warmup_steps) / max(1, max_step - warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
-
-    lr_sched = lrs.LambdaLR(optimizer, lr_factor)
-else:
-    lr_sched = None
-
-print_step_mod = max(1, max_step // 10)
-
-trn_loss = []
-val_loss = []
-stop_id = stoi[stop_char]
-
-for i in range(max_step):
-    ix = torch.randint(0, len(trn_tokenized), (batch_size,), generator=g, device=device)
-    X, Y = get_batch(ix.tolist(), trn_tokenized, device)
-    X_valid_lens = trn_valid_lens[ix]
-
-    X = forward_model(model, X, X_valid_lens, dropout_prob)
-
-    # X is (batch, seq_len, vocab_size)
-    # Y is (batch, seq_len)
-    # mask=T iff the corresponding token is not padding. We don't do a manual reduction (mean) after
-    # we've masked the padding tokens.
-    has_stop = (Y == stop_id).any(dim=1)
-    first_stop = (Y == stop_id).int().argmax(dim=1)
-    first_stop[~has_stop] = seq_len - 1
-    positions = torch.arange(seq_len, device=device).unsqueeze(0)
-    mask = (positions <= first_stop.unsqueeze(1)).view(-1)
-    loss = (F.cross_entropy(X.reshape(-1, vocab_size), Y.view(-1), reduction='none') * mask).sum() / mask.sum()
-
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    trn_loss.append(loss.item())
-    optimizer.step()
-
-    with torch.no_grad():
-        ix = torch.randint(0, len(val_tokenized), (batch_size,), generator=g, device=device)
-        X, Y = get_batch(ix.tolist(), val_tokenized, device)
-        X_valid_lens = val_valid_lens[ix]
-
-        X = forward_model(model, X, X_valid_lens)
-
-        has_stop = (Y == stop_id).any(dim=1)
-        first_stop = (Y == stop_id).int().argmax(dim=1)
-        first_stop[~has_stop] = seq_len - 1
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)
-        mask = (positions <= first_stop.unsqueeze(1)).view(-1)
-        loss = (F.cross_entropy(X.reshape(-1, vocab_size), Y.view(-1), reduction='none') * mask).sum() / mask.sum()
-        val_loss.append(loss.item())
-
-    lr_sched.step()
-
-    if i % print_step_mod == 0:
-        print(f"{i:7d} / {max_step}: trn_loss={trn_loss[-1]:4f} val_loss={val_loss[-1]:4f}")
-
-def sequence_nll(device, model, tokens, stoi):
-    if len(tokens) < 2:
-        return 0.0
-
-    inputs = torch.tensor(
-        [[stoi[token] for token in tokens[:-1]]], device=device
-    )
-    targets = torch.tensor(
-        [stoi[token] for token in tokens[1:]], device=device
-    )
-    valid_lens = torch.tensor([inputs.shape[1]], device=device)
-    logits = forward_model(model, inputs, valid_lens)
-    return F.cross_entropy(logits[0], targets, reduction="sum").item()
-
-
-def perplexity(device, model, test_strs, stoi):
-    with torch.no_grad():
-        total_nll = 0.0
-        total_tokens = 0
-
-        for s in test_strs:
-            tokens = tokenize_string(s, sorted_stoi)
-            if not 2 <= len(tokens) <= seq_len:
+        stop_id = token_to_id[STOP_TOKEN]
+        tokens: List[int] = []
+        for sample in samples:
+            tokens.extend(token_to_id[char] for char in sample)
+            tokens.append(stop_id)
+
+        token_count = len(tokens)
+        previous = [index - 1 for index in range(token_count)]
+        following = [index + 1 for index in range(token_count)]
+        if token_count:
+            previous[0] = -1
+            following[-1] = -1
+        alive = bytearray(b"\x01") * token_count
+
+        pair_positions: Dict[Tuple[int, int], set] = defaultdict(set)
+        for left in range(token_count - 1):
+            right = following[left]
+            if tokens[left] != stop_id and tokens[right] != stop_id:
+                pair_positions[(tokens[left], tokens[right])].add(left)
+
+        versions: Dict[Tuple[int, int], int] = defaultdict(int)
+        heap = [
+            (-len(positions), 0, pair)
+            for pair, positions in pair_positions.items()
+            if positions
+        ]
+        heapq.heapify(heap)
+
+        print(f"Initial vocabulary size: {len(token_to_id)}")
+        print(f"Initial token count: {token_count}")
+
+        def current_pair(left: int) -> Optional[Tuple[int, int]]:
+            if left < 0 or not alive[left]:
+                return None
+            right = following[left]
+            if right < 0 or not alive[right]:
+                return None
+            if tokens[left] == stop_id or tokens[right] == stop_id:
+                return None
+            return tokens[left], tokens[right]
+
+        def remove_pair(left: int, changed: set) -> None:
+            pair = current_pair(left)
+            if pair is not None:
+                pair_positions[pair].discard(left)
+                changed.add(pair)
+
+        def add_pair(left: int, changed: set) -> None:
+            pair = current_pair(left)
+            if pair is not None:
+                pair_positions[pair].add(left)
+                changed.add(pair)
+
+        while len(token_to_id) < target_vocab_size and heap:
+            while heap:
+                negative_count, version, pair = heapq.heappop(heap)
+                if (
+                    versions[pair] == version
+                    and -negative_count == len(pair_positions[pair])
+                    and pair_positions[pair]
+                ):
+                    break
+            else:
+                break
+
+            merged_text = id_to_token[pair[0]] + id_to_token[pair[1]]
+            if len(merged_text) > max_token_length:
+                print(
+                    f"Most frequent merge exceeds {max_token_length} characters "
+                    "(stopping)"
+                )
+                break
+
+            merged_id = token_to_id.get(merged_text)
+            if merged_id is None:
+                merged_id = len(token_to_id)
+                token_to_id[merged_text] = merged_id
+                id_to_token[merged_id] = merged_text
+
+            changed_pairs = set()
+            merged_occurrences = 0
+            for left in sorted(tuple(pair_positions[pair])):
+                if current_pair(left) != pair:
+                    continue
+
+                right = following[left]
+                before = previous[left]
+                after = following[right]
+
+                remove_pair(before, changed_pairs)
+                remove_pair(left, changed_pairs)
+                remove_pair(right, changed_pairs)
+
+                tokens[left] = merged_id
+                following[left] = after
+                if after >= 0:
+                    previous[after] = left
+                alive[right] = 0
+                previous[right] = -1
+                following[right] = -1
+
+                add_pair(before, changed_pairs)
+                add_pair(left, changed_pairs)
+                merged_occurrences += 1
+
+            for changed_pair in changed_pairs:
+                versions[changed_pair] += 1
+                count = len(pair_positions[changed_pair])
+                if count:
+                    heapq.heappush(
+                        heap,
+                        (-count, versions[changed_pair], changed_pair),
+                    )
+
+            if merged_occurrences == 0:
                 continue
+            if len(token_to_id) % 100 == 0:
+                remaining = sum(alive)
+                reduction = (token_count - remaining) / max(1, token_count)
+                print(
+                    f"Vocabulary: {len(token_to_id)} "
+                    f"({reduction:.1%} token reduction)"
+                )
 
-            total_nll += sequence_nll(device, model, tokens, stoi)
-            total_tokens += len(tokens) - 1
+        print(f"Final vocabulary size: {len(token_to_id)}")
+        return cls(token_to_id)
 
-        if total_tokens == 0:
-            raise ValueError("No test sequences contain at least two usable tokens.")
+    def encode(self, text: str, add_stop: bool = False) -> List[int]:
+        if add_stop:
+            text += STOP_TOKEN
 
-        result = math.exp(total_nll / total_tokens)
-        print(f"Perplexity: {result}")
+        result: List[int] = []
+        cursor = 0
+        while cursor < len(text):
+            node = self._trie
+            scan = cursor
+            best_id = None
+            best_end = cursor
+
+            while scan < len(text) and text[scan] in node:
+                node = node[text[scan]]
+                scan += 1
+                token_id = node.get(self._TOKEN_ID)
+                if token_id is not None:
+                    best_id = token_id
+                    best_end = scan
+
+            if best_id is None:
+                raise ValueError(
+                    f"No vocabulary token matches character {text[cursor]!r} "
+                    f"at position {cursor}."
+                )
+            result.append(best_id)
+            cursor = best_end
+
         return result
 
+    def decode(self, token_ids: Iterable[int]) -> str:
+        return "".join(self.id_to_token[token_id] for token_id in token_ids)
 
-def sample_story(device, model, temp, top_k, prompt="Once upon a time "):
-    if temp <= 0:
-        raise ValueError("temp must be positive.")
-    if not 1 <= top_k <= len(stoi):
-        raise ValueError(f"top_k must be between 1 and {len(stoi)}.")
 
-    tokens = tokenize_string(prompt, sorted_stoi)
-    if not tokens:
-        raise ValueError("prompt must contain at least one token.")
+@dataclass
+class EncodedDataset:
+    tokens: torch.Tensor
+    valid_lens: torch.Tensor
 
-    token_ids = [stoi[token] for token in tokens]
-    with torch.no_grad():
-        while len(token_ids) < seq_len:
-            x = torch.tensor([token_ids], device=device)
-            valid_lens = torch.tensor([len(token_ids)], device=device)
-            logits = forward_model(model, x, valid_lens)[0, -1, :]
-            top_logits, indices = torch.topk(logits, top_k)
-            probs = F.softmax(top_logits / temp, dim=-1)
-            sampled_index = torch.multinomial(probs, num_samples=1).item()
-            token_id = indices[sampled_index].item()
+    def __len__(self) -> int:
+        return self.tokens.shape[0]
 
+
+def encode_dataset(
+    samples: Sequence[str],
+    tokenizer: BPETokenizer,
+    max_seq_len: int,
+    name: str,
+) -> EncodedDataset:
+    encoded = []
+    discarded = 0
+    for sample in samples:
+        token_ids = tokenizer.encode(sample, add_stop=True)
+        input_length = len(token_ids) - 1
+        if input_length < 1 or input_length > max_seq_len:
+            discarded += 1
+            continue
+        encoded.append(token_ids)
+
+    if not encoded:
+        raise ValueError(f"No {name} samples fit within MINIBPE_SEQ_LEN.")
+
+    width = max(len(token_ids) for token_ids in encoded)
+    tokens = torch.full(
+        (len(encoded), width),
+        tokenizer.stop_id,
+        dtype=torch.long,
+    )
+    valid_lens = torch.empty(len(encoded), dtype=torch.long)
+    for row, token_ids in enumerate(encoded):
+        tokens[row, : len(token_ids)] = torch.tensor(token_ids)
+        valid_lens[row] = len(token_ids) - 1
+
+    print(
+        f"{name.capitalize()} samples: {len(encoded)} "
+        f"({discarded} discarded, max input length {width - 1})"
+    )
+    return EncodedDataset(tokens, valid_lens)
+
+
+def choose_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def sample_batch(
+    dataset: EncodedDataset,
+    batch_size: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    indices = torch.randint(len(dataset), (batch_size,), generator=generator)
+    valid_lens = dataset.valid_lens[indices]
+    width = int(valid_lens.max().item())
+    selected = dataset.tokens[indices, : width + 1]
+    inputs = selected[:, :-1].to(device, non_blocking=device.type == "cuda")
+    targets = selected[:, 1:].to(device, non_blocking=device.type == "cuda")
+    valid_lens = valid_lens.to(device, non_blocking=device.type == "cuda")
+    return inputs, targets, valid_lens
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.dropout = dropout
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.output = nn.Linear(d_model, d_model, bias=False)
+
+    def _project(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, seq_len, _ = x.shape
+        qkv = self.qkv(x).view(
+            batch,
+            seq_len,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        q, k, v = qkv.unbind(dim=2)
+        return (
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+        )
+
+    def forward(self, x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        q, k, v = self._project(x)
+        positions = torch.arange(seq_len, device=x.device)
+        causal = positions.unsqueeze(0) <= positions.unsqueeze(1)
+        valid_keys = positions.unsqueeze(0) < valid_lens.unsqueeze(1)
+        attention_mask = (
+            causal.view(1, 1, seq_len, seq_len)
+            & valid_keys.view(batch, 1, 1, seq_len)
+        )
+        output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.output(output)
+
+    def step(
+        self,
+        x: torch.Tensor,
+        cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        q, k, v = self._project(x)
+        if cache is not None:
+            k = torch.cat((cache[0], k), dim=2)
+            v = torch.cat((cache[1], v), dim=2)
+        output = F.scaled_dot_product_attention(q, k, v)
+        output = output.transpose(1, 2).contiguous().view(x.shape[0], 1, -1)
+        return self.output(output), (k, v)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.attention = CausalSelfAttention(d_model, num_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
+
+    def forward(self, x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(x + self.dropout(self.attention(x, valid_lens)))
+        return self.norm2(x + self.dropout(self.ffn(x)))
+
+    def step(
+        self,
+        x: torch.Tensor,
+        cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        attention, cache = self.attention.step(x, cache)
+        x = self.norm1(x + attention)
+        return self.norm2(x + self.ffn(x)), cache
+
+
+class MiniGPT(nn.Module):
+    def __init__(self, config: Config, vocab_size: int):
+        super().__init__()
+        self.max_seq_len = config.seq_len
+        self.token_embedding = nn.Embedding(vocab_size, config.d_model)
+        self.position_embedding = nn.Embedding(config.seq_len, config.d_model)
+        self.embedding_dropout = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    config.d_model,
+                    config.d_ff,
+                    config.num_heads,
+                    config.dropout,
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(config.d_model)
+        self.output = nn.Linear(config.d_model, vocab_size, bias=False)
+        self.output.weight = self.token_embedding.weight
+        self.apply(self._initialize)
+
+    @staticmethod
+    def _initialize(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        valid_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = token_ids.shape[1]
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Input length {seq_len} exceeds model limit {self.max_seq_len}."
+            )
+        positions = torch.arange(seq_len, device=token_ids.device)
+        x = self.token_embedding(token_ids) + self.position_embedding(positions)
+        x = self.embedding_dropout(x)
+        for block in self.blocks:
+            x = block(x, valid_lens)
+        return self.output(self.final_norm(x))
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_ids: Sequence[int],
+        stop_id: int,
+        temperature: float,
+        top_k: int,
+    ) -> List[int]:
+        if not prompt_ids:
+            raise ValueError("The prompt must contain at least one token.")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if not 1 <= top_k <= self.output.out_features:
+            raise ValueError(
+                f"top_k must be between 1 and {self.output.out_features}."
+            )
+        if len(prompt_ids) > self.max_seq_len:
+            raise ValueError("The prompt is longer than MINIBPE_SEQ_LEN.")
+
+        self.eval()
+        device = self.token_embedding.weight.device
+        caches: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
+            None for _ in self.blocks
+        ]
+        generated = list(prompt_ids)
+        logits = None
+
+        for position, token_id in enumerate(prompt_ids):
+            token = torch.tensor([[token_id]], device=device)
+            position_id = torch.tensor([position], device=device)
+            x = self.token_embedding(token) + self.position_embedding(position_id)
+            new_caches = []
+            for block, cache in zip(self.blocks, caches):
+                x, cache = block.step(x, cache)
+                new_caches.append(cache)
+            caches = new_caches
+            logits = self.output(self.final_norm(x))[0, -1]
+
+        while len(generated) < self.max_seq_len:
+            top_logits, top_indices = torch.topk(logits, top_k)
+            probabilities = F.softmax(top_logits / temperature, dim=-1)
+            sampled = torch.multinomial(probabilities, 1).item()
+            token_id = top_indices[sampled].item()
             if token_id == stop_id:
                 break
-            token_ids.append(token_id)
 
-    story = "".join(itos[token_id] for token_id in token_ids)
-    print(f"Story time: {story}")
-    return story
+            generated.append(token_id)
+            position = len(generated) - 1
+            token = torch.tensor([[token_id]], device=device)
+            position_id = torch.tensor([position], device=device)
+            x = self.token_embedding(token) + self.position_embedding(position_id)
+            new_caches = []
+            for block, cache in zip(self.blocks, caches):
+                x, cache = block.step(x, cache)
+                new_caches.append(cache)
+            caches = new_caches
+            logits = self.output(self.final_norm(x))[0, -1]
+
+        return generated
 
 
-def bpc(device, model, test_strs, stoi, tokenized=True):
-    with torch.no_grad():
-        total_nll = 0.0
-        total_chars = 0
+def masked_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid_lens: torch.Tensor,
+) -> torch.Tensor:
+    batch, seq_len, vocab_size = logits.shape
+    losses = F.cross_entropy(
+        logits.reshape(batch * seq_len, vocab_size),
+        targets.reshape(batch * seq_len),
+        reduction="none",
+    ).view(batch, seq_len)
+    mask = (
+        torch.arange(seq_len, device=logits.device).unsqueeze(0)
+        < valid_lens.unsqueeze(1)
+    )
+    return (losses * mask).sum() / mask.sum()
 
-        for s in test_strs:
-            tokens = tokenize_string(s, sorted_stoi) if tokenized else list(s)
-            if not 2 <= len(tokens) <= seq_len:
-                continue
 
-            total_nll += sequence_nll(device, model, tokens, stoi)
-            total_chars += sum(len(token) for token in tokens[1:])
+def autocast_context(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
 
-        if total_chars == 0:
-            raise ValueError("No test sequences contain usable characters.")
 
-        result = total_nll / (total_chars * math.log(2))
-        print(f"BPC: {result:.2f}")
-        return result
+@torch.inference_mode()
+def estimate_loss(
+    model: nn.Module,
+    dataset: EncodedDataset,
+    config: Config,
+    generator: torch.Generator,
+    device: torch.device,
+) -> float:
+    model.eval()
+    losses = []
+    for _ in range(config.eval_batches):
+        inputs, targets, valid_lens = sample_batch(
+            dataset,
+            config.batch_size,
+            generator,
+            device,
+        )
+        with autocast_context(device):
+            logits = model(inputs, valid_lens)
+            loss = masked_cross_entropy(logits, targets, valid_lens)
+        losses.append(loss.item())
+    model.train()
+    return sum(losses) / len(losses)
+
+
+def train_model(
+    model: MiniGPT,
+    train_data: EncodedDataset,
+    validation_data: EncodedDataset,
+    config: Config,
+    device: torch.device,
+) -> Tuple[List[float], List[float]]:
+    optimizer_kwargs = {"lr": config.learning_rate}
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+
+    warmup_steps = max(1, config.max_steps * 2 // 100)
+
+    def lr_factor(step: int) -> float:
+        if step < warmup_steps:
+            return (1 / 1000) + (1 - 1 / 1000) * step / warmup_steps
+        progress = (step - warmup_steps) / max(1, config.max_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    generator = torch.Generator().manual_seed(config.seed)
+    training_losses: List[float] = []
+    validation_losses: List[float] = []
+
+    forward_model = model
+    if config.compile_model:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("MINIBPE_COMPILE=1 requires torch.compile support.")
+        forward_model = torch.compile(model)
+
+    model.train()
+    for step in range(config.max_steps):
+        inputs, targets, valid_lens = sample_batch(
+            train_data,
+            config.batch_size,
+            generator,
+            device,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(device):
+            logits = forward_model(inputs, valid_lens)
+            loss = masked_cross_entropy(logits, targets, valid_lens)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        training_losses.append(loss.item())
+
+        should_evaluate = (
+            step == 0
+            or (step + 1) % config.eval_interval == 0
+            or step + 1 == config.max_steps
+        )
+        if should_evaluate:
+            validation_loss = estimate_loss(
+                forward_model,
+                validation_data,
+                config,
+                generator,
+                device,
+            )
+            validation_losses.append(validation_loss)
+            print(
+                f"{step + 1:7d}/{config.max_steps}: "
+                f"train_loss={training_losses[-1]:.4f} "
+                f"val_loss={validation_loss:.4f}"
+            )
+
+    return training_losses, validation_losses
+
+
+@torch.inference_mode()
+def perplexity(
+    model: MiniGPT,
+    tokenizer: BPETokenizer,
+    samples: Sequence[str],
+    device: torch.device,
+) -> float:
+    model.eval()
+    total_nll = 0.0
+    total_tokens = 0
+    for sample in samples:
+        token_ids = tokenizer.encode(sample, add_stop=True)
+        if not 2 <= len(token_ids) <= model.max_seq_len + 1:
+            continue
+        inputs = torch.tensor([token_ids[:-1]], device=device)
+        targets = torch.tensor([token_ids[1:]], device=device)
+        valid_lens = torch.tensor([inputs.shape[1]], device=device)
+        logits = model(inputs, valid_lens)
+        total_nll += F.cross_entropy(
+            logits[0],
+            targets[0],
+            reduction="sum",
+        ).item()
+        total_tokens += inputs.shape[1]
+
+    if total_tokens == 0:
+        raise ValueError("No evaluation samples contain usable token sequences.")
+    return math.exp(total_nll / total_tokens)
+
+
+def main() -> None:
+    config = Config.from_env()
+    torch.manual_seed(config.seed)
+    torch.set_float32_matmul_precision("high")
+    device = choose_device()
+    print(f"Device: {device}")
+
+    train_samples, validation_samples = load_data(config.data_file)
+    tokenizer = BPETokenizer.train(
+        train_samples,
+        config.vocab_size,
+        config.max_token_length,
+    )
+    train_data = encode_dataset(
+        train_samples,
+        tokenizer,
+        config.seq_len,
+        "training",
+    )
+    validation_data = encode_dataset(
+        validation_samples,
+        tokenizer,
+        config.seq_len,
+        "validation",
+    )
+
+    model = MiniGPT(config, tokenizer.vocab_size).to(device)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    print(f"Transformer parameters: {parameter_count:,}")
+    train_model(model, train_data, validation_data, config, device)
+
+
+if __name__ == "__main__":
+    main()
