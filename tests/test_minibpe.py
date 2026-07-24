@@ -9,6 +9,7 @@ from minibpe import (
     EncodedDataset,
     MiniGPT,
     create_training_components,
+    encode_dataset,
     estimate_loss,
     initialize_runtime,
     load_checkpoint,
@@ -21,7 +22,7 @@ from minibpe import (
 def tiny_config(**overrides) -> Config:
     values = {
         "data_file": Path("data/input.txt"),
-        "vocab_size": 8,
+        "vocab_size": 257,
         "seq_len": 8,
         "d_model": 12,
         "num_heads": 3,
@@ -43,7 +44,7 @@ def tiny_config(**overrides) -> Config:
 
 @pytest.fixture
 def tokenizer() -> BPETokenizer:
-    return BPETokenizer.train(["Hello world", "Hello there"], 20, 8)
+    return BPETokenizer.train(["Hello world", "Hello there"], 270, 8)
 
 
 def test_encode_decode_roundtrip(tokenizer: BPETokenizer) -> None:
@@ -57,13 +58,13 @@ def test_empty_text_roundtrip(tokenizer: BPETokenizer) -> None:
 
 
 def test_repeated_characters_roundtrip() -> None:
-    tokenizer = BPETokenizer.train(["aaaaaaaa", "aaaaaa"], 5, 8)
+    tokenizer = BPETokenizer.train(["aaaaaaaa", "aaaaaa"], 260, 8)
     assert tokenizer.decode(tokenizer.encode("aaaaaa")) == "aaaaaa"
 
 
 def test_encode_uses_learned_merge_order() -> None:
     tokenizer = BPETokenizer(
-        {"^": 0, "a": 1, "b": 2, "c": 3, "bc": 4, "ab": 5},
+        {"^": 0, b"a": 1, b"b": 2, b"c": 3, b"bc": 4, b"ab": 5},
         [(2, 3, 4), (1, 2, 5)],
     )
     assert tokenizer.encode("abc") == [1, 4]
@@ -75,7 +76,7 @@ def test_encoding_is_deterministic(tokenizer: BPETokenizer) -> None:
 
 def test_tokenizer_serialization_preserves_merges() -> None:
     original = BPETokenizer(
-        {"^": 0, "a": 1, "b": 2, "c": 3, "bc": 4, "ab": 5},
+        {"^": 0, b"a": 1, b"b": 2, b"c": 3, b"bc": 4, b"ab": 5},
         [(2, 3, 4), (1, 2, 5)],
     )
     restored = BPETokenizer.from_dict(original.to_dict())
@@ -84,14 +85,18 @@ def test_tokenizer_serialization_preserves_merges() -> None:
 
 
 def test_max_token_length_skips_invalid_pair() -> None:
-    tokenizer = BPETokenizer.train(["aaaaaaaa", "bc"], 6, max_token_length=2)
-    assert "bc" in tokenizer.token_to_id
+    tokenizer = BPETokenizer.train(["aaaaaaaa", "bc"], 260, max_token_length=2)
+    assert b"bc" in tokenizer.token_to_id
     assert all(len(token) <= 2 for token in tokenizer.token_to_id)
 
 
-def test_unknown_character_has_clear_error(tokenizer: BPETokenizer) -> None:
-    with pytest.raises(ValueError, match="not in the tokenizer vocabulary"):
-        tokenizer.encode("Hello!")
+def test_byte_level_tokenizer_handles_unseen_unicode(tokenizer: BPETokenizer) -> None:
+    text = "Příliš žluťoučký kůň 🐴"
+    assert tokenizer.decode(tokenizer.encode(text)) == text
+
+
+def test_byte_level_tokenizer_contains_every_byte(tokenizer: BPETokenizer) -> None:
+    assert all(bytes((value,)) in tokenizer.token_to_id for value in range(256))
 
 
 def test_model_logits_shape() -> None:
@@ -184,7 +189,7 @@ def test_evaluation_does_not_advance_training_generator() -> None:
 
 def test_checkpoint_roundtrip_restores_training_state(tmp_path: Path) -> None:
     config = tiny_config()
-    tokenizer = BPETokenizer.train(["abcd", "bcda"], 8, 8)
+    tokenizer = BPETokenizer.train(["abcd", "bcda"], 264, 8)
     model = MiniGPT(config, tokenizer.vocab_size)
     optimizer, scheduler, scaler = create_training_components(
         model,
@@ -229,6 +234,39 @@ def test_dataset_errors_are_clear(tmp_path: Path) -> None:
     empty.write_text("", encoding="utf-8")
     with pytest.raises(ValueError, match="is empty"):
         load_data(empty)
+
+
+def test_dataset_packs_long_and_empty_lines_without_discarding() -> None:
+    tokenizer = BPETokenizer.train(["abcdefgh", "", "ž"], 270, 8)
+    dataset = encode_dataset(
+        ["abcdefgh", "", "ž"],
+        tokenizer,
+        max_seq_len=4,
+        name="test",
+    )
+    expected_stream = []
+    for sample in ("abcdefgh", "", "ž"):
+        expected_stream.extend(tokenizer.encode(sample, add_stop=True))
+
+    reconstructed = []
+    for index, (row, valid_len) in enumerate(zip(dataset.tokens, dataset.valid_lens)):
+        window = row[: int(valid_len) + 1].tolist()
+        reconstructed.extend(window if index == 0 else window[1:])
+
+    assert reconstructed == expected_stream
+    assert all(valid_len <= 4 for valid_len in dataset.valid_lens)
+
+
+def test_adamw_hyperparameters_are_explicit() -> None:
+    model = MiniGPT(tiny_config(), vocab_size=8)
+    optimizer, _, _ = create_training_components(
+        model,
+        tiny_config(),
+        torch.device("cpu"),
+    )
+    group = optimizer.param_groups[0]
+    assert group["betas"] == (0.9, 0.95)
+    assert group["weight_decay"] == 0.1
 
 
 def test_invalid_head_count_is_rejected() -> None:

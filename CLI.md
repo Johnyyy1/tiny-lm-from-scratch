@@ -1,6 +1,6 @@
 # CLI guide
 
-The `minibpe.py` command-line interface supports four workflows:
+The `tiny-lm` command-line interface supports four workflows:
 
 - `train` creates a tokenizer and trains a new model.
 - `resume` continues training from a checkpoint.
@@ -10,16 +10,16 @@ The `minibpe.py` command-line interface supports four workflows:
 Run the top-level help command at any time:
 
 ```sh
-python3 minibpe.py --help
+tiny-lm --help
 ```
 
 For command-specific options:
 
 ```sh
-python3 minibpe.py train --help
-python3 minibpe.py resume --help
-python3 minibpe.py generate --help
-python3 minibpe.py evaluate --help
+tiny-lm train --help
+tiny-lm resume --help
+tiny-lm generate --help
+tiny-lm evaluate --help
 ```
 
 ## Setup
@@ -30,7 +30,7 @@ dependencies:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+python3 -m pip install -e ".[dev]"
 ```
 
 The CLI automatically selects the first available device in this order:
@@ -42,7 +42,7 @@ The CLI automatically selects the first available device in this order:
 Use `--device` with any command to select a device explicitly:
 
 ```sh
-python3 minibpe.py generate checkpoints/latest.pt \
+tiny-lm generate checkpoints/latest.pt \
   --device cpu \
   --prompt "Once upon a time "
 ```
@@ -52,7 +52,7 @@ python3 minibpe.py generate checkpoints/latest.pt \
 Start training with the defaults:
 
 ```sh
-python3 minibpe.py train
+tiny-lm train
 ```
 
 By default, the training data is read from `data/input.txt`, and the latest
@@ -61,7 +61,7 @@ state is written to `checkpoints/latest.pt`.
 A shorter custom run:
 
 ```sh
-python3 minibpe.py train \
+tiny-lm train \
   --data-file /path/to/training_data.txt \
   --vocab-size 5000 \
   --seq-len 512 \
@@ -77,15 +77,15 @@ python3 minibpe.py train \
   --checkpoint-interval 250
 ```
 
-The input file must be UTF-8 text with one sample per line. The `^` character
-is reserved as the stop token and cannot appear in a sample.
+The input file must be UTF-8 text with one sample per line. The byte-level
+tokenizer accepts every UTF-8 string, including unseen characters and emoji.
 
 Useful training options:
 
 | Option | Purpose |
 | --- | --- |
 | `--data-file PATH` | Select the training text file. |
-| `--vocab-size N` | Set the target BPE vocabulary size. |
+| `--vocab-size N` | Set the target BPE vocabulary size (minimum 257). |
 | `--seq-len N` | Set the maximum model context length. |
 | `--batch-size N` | Set the number of sampled sequences per step. |
 | `--max-steps N` | Set the total number of training steps. |
@@ -104,13 +104,13 @@ Continue an interrupted run using the target step count stored in its
 checkpoint:
 
 ```sh
-python3 minibpe.py resume checkpoints/latest.pt
+tiny-lm resume checkpoints/latest.pt
 ```
 
 Extend a completed run to a higher total number of steps:
 
 ```sh
-python3 minibpe.py resume checkpoints/latest.pt --max-steps 250000
+tiny-lm resume checkpoints/latest.pt --max-steps 250000
 ```
 
 When the total step target changes, the CLI preserves optimizer momentum and
@@ -119,7 +119,7 @@ starts a fresh warmup/cosine learning-rate schedule for the additional steps.
 To preserve the original checkpoint and write the resumed run elsewhere:
 
 ```sh
-python3 minibpe.py resume checkpoints/latest.pt \
+tiny-lm resume checkpoints/latest.pt \
   --max-steps 250000 \
   --output-checkpoint checkpoints/extended.pt
 ```
@@ -138,7 +138,7 @@ A checkpoint contains:
 Generate text from a checkpoint:
 
 ```sh
-python3 minibpe.py generate checkpoints/latest.pt \
+tiny-lm generate checkpoints/latest.pt \
   --prompt "Once upon a time " \
   --temperature 0.8 \
   --top-k 50 \
@@ -155,14 +155,14 @@ Generation options:
 | `--max-new-tokens N` | Limit the number of generated tokens. |
 | `--seed N` | Reproduce a sampling run. |
 
-The prompt must only contain characters represented in the saved tokenizer.
+The prompt may contain any UTF-8 text.
 
 ## Evaluate
 
 Evaluate the validation split saved in the checkpoint configuration:
 
 ```sh
-python3 minibpe.py evaluate checkpoints/latest.pt
+tiny-lm evaluate checkpoints/latest.pt
 ```
 
 The command prints average cross-entropy loss and perplexity:
@@ -175,7 +175,7 @@ validation_perplexity=64.549263
 Evaluate a limited number of usable samples:
 
 ```sh
-python3 minibpe.py evaluate checkpoints/latest.pt \
+tiny-lm evaluate checkpoints/latest.pt \
   --split validation \
   --max-samples 100 \
   --batch-size 16
@@ -184,7 +184,7 @@ python3 minibpe.py evaluate checkpoints/latest.pt \
 Evaluate the training split or a relocated dataset:
 
 ```sh
-python3 minibpe.py evaluate checkpoints/latest.pt \
+tiny-lm evaluate checkpoints/latest.pt \
   --split train \
   --data-file /new/path/to/training_data.txt
 ```
@@ -197,7 +197,7 @@ Activate the virtual environment and install the requirements:
 
 ```sh
 source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+python3 -m pip install -e ".[dev]"
 ```
 
 ### Training data not found
@@ -205,7 +205,7 @@ python3 -m pip install -r requirements.txt
 Pass its location explicitly:
 
 ```sh
-python3 minibpe.py train --data-file /path/to/training_data.txt
+tiny-lm train --data-file /path/to/training_data.txt
 ```
 
 ### Resume target is not higher than the saved step
@@ -213,7 +213,7 @@ python3 minibpe.py train --data-file /path/to/training_data.txt
 Inspect the error's checkpoint step, then provide a larger total:
 
 ```sh
-python3 minibpe.py resume checkpoints/latest.pt --max-steps 250000
+tiny-lm resume checkpoints/latest.pt --max-steps 250000
 ```
 
 ### Out of memory
@@ -221,5 +221,5 @@ python3 minibpe.py resume checkpoints/latest.pt --max-steps 250000
 Lower the batch size, sequence length, or model dimensions:
 
 ```sh
-python3 minibpe.py train --batch-size 4 --seq-len 256 --d-model 512
+tiny-lm train --batch-size 4 --seq-len 256 --d-model 512
 ```

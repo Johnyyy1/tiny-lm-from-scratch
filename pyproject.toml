@@ -1,7 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-lm-from-scratch"
+version = "0.1.0"
+description = "A decoder-only Transformer and byte-level BPE tokenizer implemented in PyTorch."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+tiny-lm = "minibpe:main"
+
+[tool.setuptools]
+py-modules = ["minibpe"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

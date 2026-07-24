@@ -5,6 +5,7 @@ import heapq
 import math
 import os
 import random
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
@@ -17,7 +18,8 @@ import torch.nn.functional as F
 from torch import nn
 
 STOP_TOKEN = "^"
-CHECKPOINT_VERSION = 1
+BYTE_VOCAB_SIZE = 256
+CHECKPOINT_VERSION = 2
 
 
 # =============================================================================
@@ -99,6 +101,11 @@ class Config:
                 raise ValueError(f"{name} must be positive.")
         if self.max_steps < 0:
             raise ValueError("MINIBPE_MAX_STEPS cannot be negative.")
+        if self.vocab_size < BYTE_VOCAB_SIZE + 1:
+            raise ValueError(
+                "MINIBPE_VOCAB_SIZE must be at least 257 "
+                "(256 byte tokens plus the end-of-text token)."
+            )
         if self.d_model % self.num_heads:
             raise ValueError("MINIBPE_NUM_HEADS must divide MINIBPE_D_MODEL.")
         if not math.isfinite(self.dropout) or not 0 <= self.dropout < 1:
@@ -131,9 +138,6 @@ def load_data(path: Path) -> tuple[list[str], list[str]]:
         raise ValueError(f"Dataset file {str(path)!r} is empty.")
     if len(data) < 2:
         raise ValueError("Dataset must contain at least two lines for train/validation splitting.")
-    if any(STOP_TOKEN in sample for sample in data):
-        raise ValueError(f"Training samples cannot contain the reserved token {STOP_TOKEN!r}.")
-
     split_index = max(1, min(len(data) - 1, int(len(data) * 0.9)))
     return data[:split_index], data[split_index:]
 
@@ -144,16 +148,17 @@ def load_data(path: Path) -> tuple[list[str], list[str]]:
 
 
 class BPETokenizer:
-    """Byte-pair-encoding tokenizer trained from a character vocabulary."""
+    """UTF-8 byte-level byte-pair-encoding tokenizer."""
 
     def __init__(
         self,
-        token_to_id: dict[str, int],
+        token_to_id: dict[str | bytes, int],
         merges: Sequence[tuple[int, int, int]] | None = None,
     ):
         self.token_to_id = dict(token_to_id)
         self.id_to_token = {token_id: token for token, token_id in token_to_id.items()}
         self.stop_id = token_to_id[STOP_TOKEN]
+        self.byte_level = any(isinstance(token, bytes) for token in token_to_id)
         self.merges = list(merges) if merges is not None else self._infer_merges()
         self._merge_ranks = {
             (left_id, right_id): (rank, merged_id)
@@ -164,7 +169,7 @@ class BPETokenizer:
     def vocab_size(self) -> int:
         return len(self.token_to_id)
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str | bytes, int]:
         """Serialize the token vocabulary."""
 
         return dict(self.token_to_id)
@@ -172,12 +177,12 @@ class BPETokenizer:
     @classmethod
     def from_dict(
         cls,
-        values: dict[str, int],
+        values: dict[str | bytes, int],
         merges: Sequence[Sequence[int]] | None = None,
     ) -> BPETokenizer:
         """Restore a tokenizer from a serialized vocabulary and merge list."""
 
-        token_to_id = {str(token): int(token_id) for token, token_id in values.items()}
+        token_to_id = {token: int(token_id) for token, token_id in values.items()}
         if token_to_id.get(STOP_TOKEN) != 0:
             raise ValueError("Checkpoint tokenizer has an invalid stop token.")
         expected_ids = set(range(len(token_to_id)))
@@ -196,14 +201,18 @@ class BPETokenizer:
         merges: list[tuple[int, int, int]] = []
         ranks: dict[tuple[int, int], tuple[int, int]] = {}
         ordered_tokens = sorted(self.id_to_token.items())
-        for merged_id, merged_text in ordered_tokens:
-            if len(merged_text) < 2:
+        for merged_id, merged_token in ordered_tokens:
+            if merged_token == STOP_TOKEN or len(merged_token) < 2:
                 continue
-            token_ids = [self.token_to_id[char] for char in merged_text]
+            if isinstance(merged_token, bytes):
+                base_tokens: Iterable[str | bytes] = (bytes((value,)) for value in merged_token)
+            else:
+                base_tokens = merged_token
+            token_ids = [self.token_to_id[token] for token in base_tokens]
             token_ids = self._apply_merges(token_ids, ranks)
             if len(token_ids) != 2:
                 raise ValueError(
-                    f"Cannot reconstruct merge rule for vocabulary token {merged_text!r}."
+                    f"Cannot reconstruct merge rule for vocabulary token {merged_token!r}."
                 )
             left_id, right_id = token_ids
             merges.append((left_id, right_id, merged_id))
@@ -253,11 +262,10 @@ class BPETokenizer:
     ) -> BPETokenizer:
         """Build a BPE vocabulary from the supplied text samples."""
 
-        characters = sorted({char for sample in samples for char in sample})
-        if not characters:
+        if not any(samples):
             raise ValueError("Cannot train a tokenizer on empty text.")
-        token_to_id = {char: index + 1 for index, char in enumerate(characters)}
-        token_to_id[STOP_TOKEN] = 0
+        token_to_id: dict[str | bytes, int] = {STOP_TOKEN: 0}
+        token_to_id.update({bytes((value,)): value + 1 for value in range(BYTE_VOCAB_SIZE)})
         id_to_token = {token_id: token for token, token_id in token_to_id.items()}
         merges: list[tuple[int, int, int]] = []
         recorded_pairs = set()
@@ -271,7 +279,7 @@ class BPETokenizer:
         stop_id = token_to_id[STOP_TOKEN]
         tokens: list[int] = []
         for sample in samples:
-            tokens.extend(token_to_id[char] for char in sample)
+            tokens.extend(token_to_id[bytes((value,))] for value in sample.encode("utf-8"))
             tokens.append(stop_id)
 
         token_count = len(tokens)
@@ -329,16 +337,20 @@ class BPETokenizer:
             else:
                 break
 
-            merged_text = id_to_token[pair[0]] + id_to_token[pair[1]]
-            if len(merged_text) > max_token_length:
+            left_token = id_to_token[pair[0]]
+            right_token = id_to_token[pair[1]]
+            if not isinstance(left_token, bytes) or not isinstance(right_token, bytes):
+                raise TypeError("BPE attempted to merge a special token.")
+            merged_token = left_token + right_token
+            if len(merged_token) > max_token_length:
                 invalid_pairs.add(pair)
                 continue
 
-            merged_id = token_to_id.get(merged_text)
+            merged_id = token_to_id.get(merged_token)
             if merged_id is None:
                 merged_id = len(token_to_id)
-                token_to_id[merged_text] = merged_id
-                id_to_token[merged_id] = merged_text
+                token_to_id[merged_token] = merged_id
+                id_to_token[merged_id] = merged_token
             if pair not in recorded_pairs:
                 merges.append((pair[0], pair[1], merged_id))
                 recorded_pairs.add(pair)
@@ -385,14 +397,18 @@ class BPETokenizer:
     def encode(self, text: str, add_stop: bool = False) -> list[int]:
         """Convert text into token IDs using the learned BPE merge order."""
 
-        token_ids = []
-        for position, char in enumerate(text):
-            try:
-                token_ids.append(self.token_to_id[char])
-            except KeyError:
-                raise ValueError(
-                    f"Character {char!r} at position {position} is not in the tokenizer vocabulary."
-                ) from None
+        if self.byte_level:
+            token_ids = [self.token_to_id[bytes((value,))] for value in text.encode("utf-8")]
+        else:
+            token_ids = []
+            for position, char in enumerate(text):
+                try:
+                    token_ids.append(self.token_to_id[char])
+                except KeyError:
+                    raise ValueError(
+                        f"Character {char!r} at position {position} "
+                        "is not in the tokenizer vocabulary."
+                    ) from None
         token_ids = self._apply_merges(token_ids, self._merge_ranks)
         if add_stop:
             token_ids.append(self.stop_id)
@@ -402,9 +418,13 @@ class BPETokenizer:
         """Convert token IDs back into text."""
 
         try:
-            return "".join(self.id_to_token[token_id] for token_id in token_ids)
+            tokens = [self.id_to_token[token_id] for token_id in token_ids]
         except KeyError as exc:
             raise ValueError(f"Unknown token ID: {exc.args[0]}") from None
+        if not self.byte_level:
+            return "".join(token for token in tokens if isinstance(token, str))
+        byte_tokens = [token for token in tokens if isinstance(token, bytes)]
+        return b"".join(byte_tokens).decode("utf-8", errors="replace")
 
 
 # =============================================================================
@@ -427,20 +447,18 @@ def encode_dataset(
     max_seq_len: int,
     name: str,
 ) -> EncodedDataset:
-    encoded = []
-    discarded = 0
+    token_stream: list[int] = []
     for sample in samples:
-        token_ids = tokenizer.encode(sample, add_stop=True)
-        input_length = len(token_ids) - 1
-        if input_length < 1 or input_length > max_seq_len:
-            discarded += 1
-            continue
-        encoded.append(token_ids)
+        token_stream.extend(tokenizer.encode(sample, add_stop=True))
 
-    if not encoded:
-        raise ValueError(f"No {name} samples fit within MINIBPE_SEQ_LEN.")
+    if len(token_stream) < 2:
+        raise ValueError(f"The {name} split does not contain enough tokens.")
 
-    width = max(len(token_ids) for token_ids in encoded)
+    encoded = [
+        token_stream[start : start + max_seq_len + 1]
+        for start in range(0, len(token_stream) - 1, max_seq_len)
+    ]
+    width = max(len(window) for window in encoded)
     tokens = torch.full(
         (len(encoded), width),
         tokenizer.stop_id,
@@ -452,8 +470,8 @@ def encode_dataset(
         valid_lens[row] = len(token_ids) - 1
 
     print(
-        f"{name.capitalize()} samples: {len(encoded)} "
-        f"({discarded} discarded, max input length {width - 1})"
+        f"{name.capitalize()} tokens: {len(token_stream):,} "
+        f"({len(encoded):,} packed windows, max input length {width - 1})"
     )
     return EncodedDataset(tokens, valid_lens)
 
@@ -569,17 +587,17 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tensor:
-        x = self.norm1(x + self.dropout(self.attention(x, valid_lens)))
-        return self.norm2(x + self.dropout(self.ffn(x)))
+        x = x + self.dropout(self.attention(self.norm1(x), valid_lens))
+        return x + self.dropout(self.ffn(self.norm2(x)))
 
     def step(
         self,
         x: torch.Tensor,
         cache: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        attention, cache = self.attention.step(x, cache)
-        x = self.norm1(x + attention)
-        return self.norm2(x + self.ffn(x)), cache
+        attention, cache = self.attention.step(self.norm1(x), cache)
+        x = x + self.dropout(attention)
+        return x + self.dropout(self.ffn(self.norm2(x))), cache
 
 
 class MiniGPT(nn.Module):
@@ -769,7 +787,11 @@ def create_training_components(
     config: Config,
     device: torch.device,
 ):
-    optimizer_kwargs = {"lr": config.learning_rate}
+    optimizer_kwargs = {
+        "lr": config.learning_rate,
+        "betas": (0.9, 0.95),
+        "weight_decay": 0.1,
+    }
     if device.type == "cuda":
         optimizer_kwargs["fused"] = True
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
@@ -973,6 +995,7 @@ def train_model(
 
     model.train()
     last_saved_step = -1
+    training_started = time.perf_counter()
     for step in range(start_step, config.max_steps):
         inputs, targets, valid_lens = sample_batch(
             train_data,
@@ -987,13 +1010,18 @@ def train_model(
             loss = masked_cross_entropy(logits, targets, valid_lens)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
         training_losses.append(loss.item())
+        completed_step = step + 1
 
         should_evaluate = (
-            step == 0 or (step + 1) % config.eval_interval == 0 or step + 1 == config.max_steps
+            step == 0
+            or completed_step % config.eval_interval == 0
+            or completed_step == config.max_steps
         )
         if should_evaluate:
             validation_loss = estimate_loss(
@@ -1004,13 +1032,19 @@ def train_model(
                 device,
             )
             validation_losses.append(validation_loss)
+            elapsed = time.perf_counter() - training_started
+            session_steps = completed_step - start_step
+            remaining = config.max_steps - completed_step
+            eta = elapsed / session_steps * remaining
             print(
-                f"{step + 1:7d}/{config.max_steps}: "
+                f"{completed_step:7d}/{config.max_steps}: "
                 f"train_loss={training_losses[-1]:.4f} "
-                f"val_loss={validation_loss:.4f}"
+                f"val_loss={validation_loss:.4f} "
+                f"grad_norm={float(gradient_norm):.4f} "
+                f"lr={optimizer.param_groups[0]['lr']:.2e} "
+                f"elapsed={elapsed:.1f}s eta={eta:.1f}s"
             )
 
-        completed_step = step + 1
         if checkpoint_path is not None and completed_step % checkpoint_interval == 0:
             save_checkpoint(
                 checkpoint_path,
@@ -1059,27 +1093,9 @@ def perplexity(
     samples: Sequence[str],
     device: torch.device,
 ) -> float:
-    model.eval()
-    total_nll = 0.0
-    total_tokens = 0
-    for sample in samples:
-        token_ids = tokenizer.encode(sample, add_stop=True)
-        if not 2 <= len(token_ids) <= model.max_seq_len + 1:
-            continue
-        inputs = torch.tensor([token_ids[:-1]], device=device)
-        targets = torch.tensor([token_ids[1:]], device=device)
-        valid_lens = torch.tensor([inputs.shape[1]], device=device)
-        logits = model(inputs, valid_lens)
-        total_nll += F.cross_entropy(
-            logits[0],
-            targets[0],
-            reduction="sum",
-        ).item()
-        total_tokens += inputs.shape[1]
-
-    if total_tokens == 0:
-        raise ValueError("No evaluation samples contain usable token sequences.")
-    return math.exp(total_nll / total_tokens)
+    dataset = encode_dataset(samples, tokenizer, model.max_seq_len, "evaluation")
+    _, result = dataset_metrics(model, dataset, batch_size=1, device=device)
+    return result
 
 
 @torch.inference_mode()
@@ -1189,7 +1205,7 @@ def config_with_cli_overrides(
     return updated
 
 
-def initialize_runtime(seed: int, requested_device: str) -> torch.device:
+def initialize_runtime(seed: int, requested_device: str = "auto") -> torch.device:
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():

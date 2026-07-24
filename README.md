@@ -1,6 +1,6 @@
 # Tiny LM from Scratch
 
-A small language model built from scratch in PyTorch, including a custom BPE tokenizer, decoder-only Transformer, training loop, checkpointing, evaluation, and text generation.
+A small language model built from scratch in PyTorch, including a byte-level BPE tokenizer, decoder-only Transformer, training loop, checkpointing, evaluation, and text generation.
 
 The purpose of this project is to understand how the main components of a language model work together without relying on high-level Transformer or tokenizer libraries.
 
@@ -26,14 +26,15 @@ It is designed as an educational implementation rather than a production-ready l
 
 ## Features
 
-* Custom BPE tokenizer
+* Byte-level BPE tokenizer with complete UTF-8 coverage
 * Tokenizer training on arbitrary text datasets
 * Decoder-only Transformer implemented in PyTorch
 * Multi-head causal self-attention
 * Token and positional embeddings
 * Feed-forward Transformer blocks
 * Weight tying between embeddings and output projection
-* AdamW optimizer
+* AdamW optimizer with explicit betas and weight decay
+* Gradient clipping
 * Learning-rate warmup and cosine decay
 * Mixed-precision training where supported
 * Training and validation loss evaluation
@@ -46,16 +47,12 @@ It is designed as an educational implementation rather than a production-ready l
 
 The model follows a decoder-only Transformer architecture similar to small GPT-style language models.
 
-Each Transformer block contains:
+Each Transformer block uses a pre-norm layout:
 
 ```text
 Input
-  ├── Layer normalization
-  ├── Causal multi-head self-attention
-  ├── Residual connection
-  ├── Layer normalization
-  ├── Feed-forward network
-  └── Residual connection
+  ├── Layer normalization → causal multi-head self-attention → residual addition
+  └── Layer normalization → feed-forward network → residual addition
 ```
 
 The causal attention mask prevents each token from accessing future tokens.
@@ -64,9 +61,12 @@ The model predicts the next token for every position in the input sequence.
 
 ## Tokenizer
 
-The tokenizer builds its vocabulary using Byte Pair Encoding.
+The tokenizer builds its vocabulary using byte-level Byte Pair Encoding.
 
-BPE starts with a base vocabulary and repeatedly merges frequent adjacent token pairs into new tokens.
+BPE starts with all 256 possible byte values plus an end-of-text token. It then
+repeatedly merges frequent adjacent token pairs into new tokens. Text is encoded
+as UTF-8 before applying the learned merges, so unseen characters and emoji do
+not cause out-of-vocabulary errors.
 
 For example:
 
@@ -78,7 +78,7 @@ low er
 lower
 ```
 
-Frequent character sequences gradually become individual tokens.
+Frequent byte sequences gradually become individual tokens.
 
 The tokenizer supports:
 
@@ -122,11 +122,13 @@ Activate it on Windows:
 .venv\Scripts\activate
 ```
 
-Install the required dependencies:
+Install the project and development dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
+
+This also installs the `tiny-lm` command.
 
 ## Dataset
 
@@ -147,12 +149,16 @@ curl -o data/input.txt \
 
 Small datasets are useful for validating the pipeline, but they will not produce a generally capable language model.
 
+Dataset lines are joined with end-of-text tokens and packed into contiguous
+training windows. Long and empty lines are not discarded, and padding is
+limited to the final partial window in each split.
+
 ## Training
 
 Train the tokenizer and language model:
 
 ```bash
-python minibpe.py train \
+tiny-lm train \
   --data-file data/input.txt \
   --vocab-size 1024 \
   --max-steps 5000
@@ -161,7 +167,7 @@ python minibpe.py train \
 Example with a smaller model:
 
 ```bash
-python minibpe.py train \
+tiny-lm train \
   --data-file data/input.txt \
   --vocab-size 512 \
   --seq-len 256 \
@@ -176,6 +182,7 @@ During training, the program reports:
 * current step,
 * training loss,
 * validation loss,
+* gradient norm,
 * learning rate,
 * elapsed time,
 * estimated completion progress.
@@ -185,7 +192,7 @@ During training, the program reports:
 Training can be resumed from a saved checkpoint:
 
 ```bash
-python minibpe.py resume checkpoints/latest.pt \
+tiny-lm resume checkpoints/latest.pt \
   --max-steps 10000
 ```
 
@@ -204,7 +211,7 @@ Checkpoints include:
 Generate text from a trained checkpoint:
 
 ```bash
-python minibpe.py generate checkpoints/latest.pt \
+tiny-lm generate checkpoints/latest.pt \
   --prompt "ROMEO:" \
   --max-new-tokens 200
 ```
@@ -212,7 +219,7 @@ python minibpe.py generate checkpoints/latest.pt \
 Generation can be controlled using temperature and top-k sampling:
 
 ```bash
-python minibpe.py generate checkpoints/latest.pt \
+tiny-lm generate checkpoints/latest.pt \
   --prompt "ROMEO:" \
   --max-new-tokens 200 \
   --temperature 0.8 \
@@ -228,7 +235,7 @@ Higher temperatures produce more varied but less reliable output.
 Evaluate a trained checkpoint:
 
 ```bash
-python minibpe.py evaluate checkpoints/latest.pt \
+tiny-lm evaluate checkpoints/latest.pt \
   --data-file data/input.txt
 ```
 
@@ -236,19 +243,23 @@ The evaluation reports loss and perplexity on the selected dataset split.
 
 ## Example results
 
-The following section should contain results from an actual completed training run.
+Results from a completed Tiny Shakespeare training run:
 
-| Dataset          | Parameters | Training steps | Validation loss | Perplexity | Device |
-| ---------------- | ---------: | -------------: | --------------: | ---------: | ------ |
-| Tiny Shakespeare |        TBD |            TBD |             TBD |        TBD | TBD    |
+| Dataset | Tokenizer vocabulary | Parameters | Training steps | Training time | Validation loss | Perplexity | Device |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Tiny Shakespeare | 1,024 | 938,752 | 10,000 | 3m 38s | 3.578311 | 35.812993 | Apple M4 16 GB (MPS) |
+
+The model used a context length of 128, four layers, four attention heads,
+an embedding width of 128, a batch size of 16, and seed 42. Validation loss
+and perplexity were calculated over the complete packed validation split.
 
 ### Generated sample
 
 ```text
-Add an unedited sample generated by the trained model here.
+KING RICHARD II: yet the kinter vile and fillild my heart,
 ```
 
-Generated samples should be shown without manually correcting their grammar or punctuation.
+This is an unedited sample generated with temperature 1.0, top-k 50, and seed 7.
 
 ## Project structure
 
@@ -270,7 +281,7 @@ Run the same checks used by CI:
 ```bash
 ruff check .
 ruff format --check .
-pytest
+python -m pytest
 ```
 
 ## What I learned
@@ -306,11 +317,12 @@ This project helped me understand:
 * [x] Checkpoint saving and loading
 * [x] Autoregressive text generation
 * [x] KV cache
-* [x] Automated tests and CI
+* [ ] Automated tests and CI (implementation complete; remote run must pass)
 * [ ] Split the implementation into separate modules
 * [ ] Add training-loss visualizations
-* [ ] Add byte-level BPE
-* [ ] Add benchmark results
+* [x] Add byte-level BPE
+* [x] Pack the dataset into contiguous token windows
+* [x] Add benchmark results
 * [ ] Compare the tokenizer with a reference implementation
 
 ## Acknowledgements
