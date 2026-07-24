@@ -1,11 +1,12 @@
+import argparse
 import heapq
 import math
 import os
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 
 
 STOP_TOKEN = "^"
+CHECKPOINT_VERSION = 1
 
 
 def env_int(name: str, default: int) -> int:
@@ -100,6 +102,19 @@ class Config:
         if self.learning_rate <= 0:
             raise ValueError("MINIBPE_LEARNING_RATE must be positive.")
 
+    def to_dict(self) -> Dict[str, Any]:
+        values = asdict(self)
+        values["data_file"] = str(self.data_file)
+        return values
+
+    @classmethod
+    def from_dict(cls, values: Dict[str, Any]) -> "Config":
+        values = dict(values)
+        values["data_file"] = Path(values["data_file"])
+        config = cls(**values)
+        config.validate()
+        return config
+
 
 def load_data(path: Path) -> Tuple[List[str], List[str]]:
     if not path.is_file():
@@ -140,6 +155,19 @@ class BPETokenizer:
     @property
     def vocab_size(self) -> int:
         return len(self.token_to_id)
+
+    def to_dict(self) -> Dict[str, int]:
+        return dict(self.token_to_id)
+
+    @classmethod
+    def from_dict(cls, values: Dict[str, int]) -> "BPETokenizer":
+        token_to_id = {str(token): int(token_id) for token, token_id in values.items()}
+        if token_to_id.get(STOP_TOKEN) != 0:
+            raise ValueError("Checkpoint tokenizer has an invalid stop token.")
+        expected_ids = set(range(len(token_to_id)))
+        if set(token_to_id.values()) != expected_ids:
+            raise ValueError("Checkpoint tokenizer IDs must be contiguous.")
+        return cls(token_to_id)
 
     @classmethod
     def train(
@@ -366,12 +394,18 @@ def encode_dataset(
     return EncodedDataset(tokens, valid_lens)
 
 
-def choose_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+def choose_device(requested: str = "auto") -> torch.device:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available.")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is not available.")
+    return torch.device(requested)
 
 
 def sample_batch(
@@ -540,6 +574,7 @@ class MiniGPT(nn.Module):
         stop_id: int,
         temperature: float,
         top_k: int,
+        max_new_tokens: Optional[int] = None,
     ) -> List[int]:
         if not prompt_ids:
             raise ValueError("The prompt must contain at least one token.")
@@ -551,6 +586,8 @@ class MiniGPT(nn.Module):
             )
         if len(prompt_ids) > self.max_seq_len:
             raise ValueError("The prompt is longer than MINIBPE_SEQ_LEN.")
+        if max_new_tokens is not None and max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive.")
 
         self.eval()
         device = self.token_embedding.weight.device
@@ -571,7 +608,14 @@ class MiniGPT(nn.Module):
             caches = new_caches
             logits = self.output(self.final_norm(x))[0, -1]
 
-        while len(generated) < self.max_seq_len:
+        generation_limit = self.max_seq_len
+        if max_new_tokens is not None:
+            generation_limit = min(
+                generation_limit,
+                len(prompt_ids) + max_new_tokens,
+            )
+
+        while len(generated) < generation_limit:
             top_logits, top_indices = torch.topk(logits, top_k)
             probabilities = F.softmax(top_logits / temperature, dim=-1)
             sampled = torch.multinomial(probabilities, 1).item()
@@ -643,31 +687,192 @@ def estimate_loss(
     return sum(losses) / len(losses)
 
 
-def train_model(
-    model: MiniGPT,
-    train_data: EncodedDataset,
-    validation_data: EncodedDataset,
-    config: Config,
-    device: torch.device,
-) -> Tuple[List[float], List[float]]:
-    optimizer_kwargs = {"lr": config.learning_rate}
-    if device.type == "cuda":
-        optimizer_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
-
-    warmup_steps = max(1, config.max_steps * 2 // 100)
+def create_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+):
+    warmup_steps = max(1, total_steps * 2 // 100)
 
     def lr_factor(step: int) -> float:
         if step < warmup_steps:
             return (1 / 1000) + (1 - 1 / 1000) * step / warmup_steps
-        progress = (step - warmup_steps) / max(1, config.max_steps - warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1 + math.cos(math.pi * min(progress, 1)))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+
+
+def create_training_components(
+    model: MiniGPT,
+    config: Config,
+    device: torch.device,
+):
+    optimizer_kwargs = {"lr": config.learning_rate}
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    scheduler = create_lr_scheduler(optimizer, config.max_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    return optimizer, scheduler, scaler
+
+
+def capture_rng_state(batch_generator: torch.Generator) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "torch": torch.get_rng_state(),
+        "batch_generator": batch_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    if (
+        torch.backends.mps.is_available()
+        and hasattr(torch, "mps")
+        and hasattr(torch.mps, "get_rng_state")
+    ):
+        state["mps"] = torch.mps.get_rng_state()
+    return state
+
+
+def restore_rng_state(
+    state: Dict[str, Any],
+    batch_generator: torch.Generator,
+) -> None:
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if "batch_generator" in state:
+        batch_generator.set_state(state["batch_generator"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if (
+        "mps" in state
+        and torch.backends.mps.is_available()
+        and hasattr(torch, "mps")
+        and hasattr(torch.mps, "set_rng_state")
+    ):
+        torch.mps.set_rng_state(state["mps"])
+
+
+def save_checkpoint(
+    path: Path,
+    model: MiniGPT,
+    tokenizer: BPETokenizer,
+    config: Config,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
+    step: int,
+    training_losses: Sequence[float],
+    validation_losses: Sequence[float],
+    batch_generator: torch.Generator,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "step": step,
+        "config": config.to_dict(),
+        "tokenizer": tokenizer.to_dict(),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "training_losses": list(training_losses),
+        "validation_losses": list(validation_losses),
+        "rng_state": capture_rng_state(batch_generator),
+    }
+    torch.save(payload, temporary_path)
+    temporary_path.replace(path)
+    print(f"Checkpoint saved: {path} (step {step})")
+
+
+def load_checkpoint(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if checkpoint.get("checkpoint_version") != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Unsupported checkpoint version: {checkpoint.get('checkpoint_version')!r}"
+        )
+    required = {
+        "step",
+        "config",
+        "tokenizer",
+        "model_state_dict",
+    }
+    missing = sorted(required - checkpoint.keys())
+    if missing:
+        raise ValueError(f"Checkpoint is missing fields: {', '.join(missing)}")
+    return checkpoint
+
+
+def model_from_checkpoint(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[MiniGPT, BPETokenizer, Config]:
+    config = Config.from_dict(checkpoint["config"])
+    tokenizer = BPETokenizer.from_dict(checkpoint["tokenizer"])
+    model = MiniGPT(config, tokenizer.vocab_size).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, tokenizer, config
+
+
+def train_model(
+    model: MiniGPT,
+    tokenizer: BPETokenizer,
+    train_data: EncodedDataset,
+    validation_data: EncodedDataset,
+    config: Config,
+    device: torch.device,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_interval: int = 1000,
+    resume_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[float], List[float]]:
+    optimizer, scheduler, scaler = create_training_components(
+        model,
+        config,
+        device,
+    )
     generator = torch.Generator().manual_seed(config.seed)
     training_losses: List[float] = []
     validation_losses: List[float] = []
+    start_step = 0
+
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be positive.")
+    if resume_state is not None:
+        resumable_fields = {
+            "optimizer_state_dict",
+            "scheduler_state_dict",
+            "scaler_state_dict",
+            "rng_state",
+        }
+        missing = sorted(resumable_fields - resume_state.keys())
+        if missing:
+            raise ValueError(
+                "Checkpoint cannot resume training; missing fields: "
+                + ", ".join(missing)
+            )
+        optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        scaler.load_state_dict(resume_state["scaler_state_dict"])
+        start_step = int(resume_state["step"])
+        previous_max_steps = Config.from_dict(resume_state["config"]).max_steps
+        if config.max_steps == previous_max_steps:
+            scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        else:
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = config.learning_rate
+                parameter_group["initial_lr"] = config.learning_rate
+            scheduler = create_lr_scheduler(
+                optimizer,
+                config.max_steps - start_step,
+            )
+            print(
+                "Restarting the learning-rate schedule for "
+                f"{config.max_steps - start_step} additional steps"
+            )
+        training_losses = list(resume_state.get("training_losses", []))
+        validation_losses = list(resume_state.get("validation_losses", []))
+        restore_rng_state(resume_state["rng_state"], generator)
+        print(f"Resuming from step {start_step}")
 
     forward_model = model
     if config.compile_model:
@@ -676,7 +881,8 @@ def train_model(
         forward_model = torch.compile(model)
 
     model.train()
-    for step in range(config.max_steps):
+    last_saved_step = -1
+    for step in range(start_step, config.max_steps):
         inputs, targets, valid_lens = sample_batch(
             train_data,
             config.batch_size,
@@ -715,6 +921,41 @@ def train_model(
                 f"val_loss={validation_loss:.4f}"
             )
 
+        completed_step = step + 1
+        if (
+            checkpoint_path is not None
+            and completed_step % checkpoint_interval == 0
+        ):
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                tokenizer,
+                config,
+                optimizer,
+                scheduler,
+                scaler,
+                completed_step,
+                training_losses,
+                validation_losses,
+                generator,
+            )
+            last_saved_step = completed_step
+
+    if checkpoint_path is not None and last_saved_step != config.max_steps:
+        save_checkpoint(
+            checkpoint_path,
+            model,
+            tokenizer,
+            config,
+            optimizer,
+            scheduler,
+            scaler,
+            config.max_steps,
+            training_losses,
+            validation_losses,
+            generator,
+        )
+
     return training_losses, validation_losses
 
 
@@ -748,12 +989,121 @@ def perplexity(
     return math.exp(total_nll / total_tokens)
 
 
-def main() -> None:
-    config = Config.from_env()
-    torch.manual_seed(config.seed)
+@torch.inference_mode()
+def dataset_metrics(
+    model: MiniGPT,
+    dataset: EncodedDataset,
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[float, float]:
+    model.eval()
+    total_nll = 0.0
+    total_tokens = 0
+    for start in range(0, len(dataset), batch_size):
+        end = min(start + batch_size, len(dataset))
+        valid_lens = dataset.valid_lens[start:end]
+        width = int(valid_lens.max().item())
+        selected = dataset.tokens[start:end, : width + 1]
+        inputs = selected[:, :-1].to(device)
+        targets = selected[:, 1:].to(device)
+        valid_lens = valid_lens.to(device)
+
+        with autocast_context(device):
+            logits = model(inputs, valid_lens)
+            batch, seq_len, vocab_size = logits.shape
+            losses = F.cross_entropy(
+                logits.reshape(batch * seq_len, vocab_size),
+                targets.reshape(batch * seq_len),
+                reduction="none",
+            ).view(batch, seq_len)
+            mask = (
+                torch.arange(seq_len, device=device).unsqueeze(0)
+                < valid_lens.unsqueeze(1)
+            )
+            total_nll += (losses * mask).sum().item()
+            total_tokens += mask.sum().item()
+
+    if total_tokens == 0:
+        raise ValueError("The evaluation dataset contains no usable tokens.")
+    average_loss = total_nll / total_tokens
+    return average_loss, math.exp(average_loss)
+
+
+CONFIG_ARGUMENTS = {
+    "data_file": ("--data-file", Path),
+    "vocab_size": ("--vocab-size", int),
+    "seq_len": ("--seq-len", int),
+    "d_model": ("--d-model", int),
+    "num_heads": ("--num-heads", int),
+    "d_ff": ("--d-ff", int),
+    "num_layers": ("--num-layers", int),
+    "batch_size": ("--batch-size", int),
+    "max_steps": ("--max-steps", int),
+    "eval_interval": ("--eval-interval", int),
+    "eval_batches": ("--eval-batches", int),
+    "learning_rate": ("--learning-rate", float),
+    "dropout": ("--dropout", float),
+    "max_token_length": ("--max-token-length", int),
+}
+
+
+def add_device_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="execution device (default: auto)",
+    )
+
+
+def add_config_arguments(
+    parser: argparse.ArgumentParser,
+    fields: Optional[Sequence[str]] = None,
+) -> None:
+    selected = fields or tuple(CONFIG_ARGUMENTS)
+    for field in selected:
+        option, value_type = CONFIG_ARGUMENTS[field]
+        parser.add_argument(
+            option,
+            dest=field,
+            type=value_type,
+            default=None,
+        )
+    parser.add_argument(
+        "--compile",
+        dest="compile_model",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable or disable torch.compile",
+    )
+
+
+def config_with_cli_overrides(
+    config: Config,
+    args: argparse.Namespace,
+) -> Config:
+    updates = {}
+    for field in (*CONFIG_ARGUMENTS, "compile_model"):
+        if hasattr(args, field):
+            value = getattr(args, field)
+            if value is not None:
+                updates[field] = value
+    updated = replace(config, **updates)
+    updated.validate()
+    return updated
+
+
+def initialize_runtime(seed: int, requested_device: str) -> torch.device:
+    torch.manual_seed(seed)
     torch.set_float32_matmul_precision("high")
-    device = choose_device()
+    device = choose_device(requested_device)
     print(f"Device: {device}")
+    return device
+
+
+def run_train(args: argparse.Namespace) -> None:
+    config = config_with_cli_overrides(Config.from_env(), args)
+    device = initialize_runtime(config.seed, args.device)
 
     train_samples, validation_samples = load_data(config.data_file)
     tokenizer = BPETokenizer.train(
@@ -777,7 +1127,206 @@ def main() -> None:
     model = MiniGPT(config, tokenizer.vocab_size).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"Transformer parameters: {parameter_count:,}")
-    train_model(model, train_data, validation_data, config, device)
+    train_model(
+        model,
+        tokenizer,
+        train_data,
+        validation_data,
+        config,
+        device,
+        checkpoint_path=args.checkpoint,
+        checkpoint_interval=args.checkpoint_interval,
+    )
+
+
+def run_resume(args: argparse.Namespace) -> None:
+    checkpoint = load_checkpoint(args.checkpoint)
+    checkpoint_config = Config.from_dict(checkpoint["config"])
+    config = config_with_cli_overrides(checkpoint_config, args)
+    completed_step = int(checkpoint["step"])
+    if config.max_steps <= completed_step:
+        raise ValueError(
+            f"--max-steps must exceed checkpoint step {completed_step}; "
+            f"received {config.max_steps}."
+        )
+
+    device = initialize_runtime(config.seed, args.device)
+    tokenizer = BPETokenizer.from_dict(checkpoint["tokenizer"])
+    train_samples, validation_samples = load_data(config.data_file)
+    train_data = encode_dataset(
+        train_samples,
+        tokenizer,
+        config.seq_len,
+        "training",
+    )
+    validation_data = encode_dataset(
+        validation_samples,
+        tokenizer,
+        config.seq_len,
+        "validation",
+    )
+
+    model = MiniGPT(config, tokenizer.vocab_size).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    output_checkpoint = args.output_checkpoint or args.checkpoint
+    train_model(
+        model,
+        tokenizer,
+        train_data,
+        validation_data,
+        config,
+        device,
+        checkpoint_path=output_checkpoint,
+        checkpoint_interval=args.checkpoint_interval,
+        resume_state=checkpoint,
+    )
+
+
+def run_generate(args: argparse.Namespace) -> None:
+    checkpoint = load_checkpoint(args.checkpoint)
+    config = Config.from_dict(checkpoint["config"])
+    seed = config.seed if args.seed is None else args.seed
+    device = initialize_runtime(seed, args.device)
+    model, tokenizer, _ = model_from_checkpoint(checkpoint, device)
+    prompt_ids = tokenizer.encode(args.prompt)
+    generated_ids = model.generate(
+        prompt_ids,
+        tokenizer.stop_id,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        max_new_tokens=args.max_new_tokens,
+    )
+    print(tokenizer.decode(generated_ids))
+
+
+def run_evaluate(args: argparse.Namespace) -> None:
+    checkpoint = load_checkpoint(args.checkpoint)
+    checkpoint_config = Config.from_dict(checkpoint["config"])
+    data_file = args.data_file or checkpoint_config.data_file
+    device = initialize_runtime(checkpoint_config.seed, args.device)
+    model, tokenizer, _ = model_from_checkpoint(checkpoint, device)
+    train_samples, validation_samples = load_data(data_file)
+    samples = train_samples if args.split == "train" else validation_samples
+    dataset = encode_dataset(
+        samples,
+        tokenizer,
+        checkpoint_config.seq_len,
+        args.split,
+    )
+    if args.max_samples is not None:
+        if args.max_samples < 1:
+            raise ValueError("--max-samples must be positive.")
+        dataset = EncodedDataset(
+            dataset.tokens[: args.max_samples],
+            dataset.valid_lens[: args.max_samples],
+        )
+    batch_size = args.batch_size or checkpoint_config.batch_size
+    if batch_size < 1:
+        raise ValueError("--batch-size must be positive.")
+    loss, result = dataset_metrics(
+        model,
+        dataset,
+        batch_size,
+        device,
+    )
+    print(f"{args.split}_loss={loss:.6f}")
+    print(f"{args.split}_perplexity={result:.6f}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train and use the mini BPE transformer.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    train_parser = subparsers.add_parser(
+        "train",
+        help="train a new tokenizer and model",
+    )
+    add_device_argument(train_parser)
+    add_config_arguments(train_parser)
+    train_parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoints/latest.pt"),
+        help="checkpoint output path (default: checkpoints/latest.pt)",
+    )
+    train_parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=1000,
+        help="save every N completed steps (default: 1000)",
+    )
+    train_parser.set_defaults(handler=run_train)
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="resume training from a checkpoint",
+    )
+    resume_parser.add_argument("checkpoint", type=Path)
+    add_device_argument(resume_parser)
+    add_config_arguments(
+        resume_parser,
+        fields=(
+            "data_file",
+            "batch_size",
+            "max_steps",
+            "eval_interval",
+            "eval_batches",
+        ),
+    )
+    resume_parser.add_argument(
+        "--output-checkpoint",
+        type=Path,
+        default=None,
+        help="write to a new checkpoint instead of replacing the input",
+    )
+    resume_parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=1000,
+        help="save every N completed steps (default: 1000)",
+    )
+    resume_parser.set_defaults(handler=run_resume)
+
+    generate_parser = subparsers.add_parser(
+        "generate",
+        help="generate text from a checkpoint",
+    )
+    generate_parser.add_argument("checkpoint", type=Path)
+    generate_parser.add_argument("--prompt", required=True)
+    generate_parser.add_argument("--temperature", type=float, default=1.0)
+    generate_parser.add_argument("--top-k", type=int, default=50)
+    generate_parser.add_argument("--max-new-tokens", type=int, default=100)
+    generate_parser.add_argument("--seed", type=int, default=None)
+    add_device_argument(generate_parser)
+    generate_parser.set_defaults(handler=run_generate)
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help="evaluate a checkpoint on the configured dataset",
+    )
+    evaluate_parser.add_argument("checkpoint", type=Path)
+    evaluate_parser.add_argument("--data-file", type=Path, default=None)
+    evaluate_parser.add_argument(
+        "--split",
+        choices=("train", "validation"),
+        default="validation",
+    )
+    evaluate_parser.add_argument("--batch-size", type=int, default=None)
+    evaluate_parser.add_argument("--max-samples", type=int, default=None)
+    add_device_argument(evaluate_parser)
+    evaluate_parser.set_defaults(handler=run_evaluate)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.handler(args)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

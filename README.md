@@ -1,26 +1,60 @@
 # minibpetokenizer
 
+See the complete [CLI guide](CLI.md) for setup, training, checkpoint resumption,
+generation, evaluation, configuration, and troubleshooting.
+
 Install the dependency in the project virtual environment:
 
 ```sh
 python3 -m pip install -r requirements.txt
 ```
 
-Then run:
+Train a new model:
 
 ```sh
-python3 minibpe.py
+python3 minibpe.py train
 ```
 
 The script automatically uses CUDA, Apple Metal (`mps`), or CPU in that order.
-Configuration is available through environment variables:
+CLI arguments override the corresponding environment variables:
 
 ```sh
-MINIBPE_MAX_STEPS=1000 \
-MINIBPE_BATCH_SIZE=16 \
-MINIBPE_EVAL_INTERVAL=100 \
-python3 minibpe.py
+python3 minibpe.py train \
+  --max-steps 1000 \
+  --batch-size 16 \
+  --eval-interval 100 \
+  --checkpoint checkpoints/latest.pt
 ```
+
+Training writes a resumable checkpoint to `checkpoints/latest.pt` by default.
+It contains the model, tokenizer, configuration, optimizer, scheduler, gradient
+scaler, losses, current step, and random-number-generator states.
+
+Resume an interrupted or completed run with a higher total step target:
+
+```sh
+python3 minibpe.py resume checkpoints/latest.pt --max-steps 200000
+```
+
+Generate text:
+
+```sh
+python3 minibpe.py generate checkpoints/latest.pt \
+  --prompt "Once upon a time " \
+  --temperature 0.8 \
+  --top-k 50 \
+  --max-new-tokens 100
+```
+
+Evaluate a checkpoint:
+
+```sh
+python3 minibpe.py evaluate checkpoints/latest.pt \
+  --split validation \
+  --batch-size 16
+```
+
+Run `python3 minibpe.py COMMAND --help` for all command-specific options.
 
 Common settings and their defaults:
 
