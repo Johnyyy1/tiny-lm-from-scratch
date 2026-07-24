@@ -154,8 +154,13 @@ Generation options:
 | `--top-k N` | Sample only from the `N` highest-scoring tokens. |
 | `--max-new-tokens N` | Limit the number of generated tokens. |
 | `--seed N` | Reproduce a sampling run. |
+| `--continue-after-eot` | Continue across end-of-text boundaries and print them as newlines. |
 
 The prompt may contain any UTF-8 text.
+
+By default, generation stops at the first end-of-text token. Use
+`--continue-after-eot` for a longer, multi-line sample that shows transitions
+between dataset lines.
 
 ## Evaluate
 

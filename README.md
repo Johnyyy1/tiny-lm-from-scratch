@@ -1,5 +1,7 @@
 # Tiny LM from Scratch
 
+[![Tests](https://github.com/Johnyyy1/tiny-lm-from-scratch/actions/workflows/tests.yml/badge.svg)](https://github.com/Johnyyy1/tiny-lm-from-scratch/actions/workflows/tests.yml)
+
 A small language model built from scratch in PyTorch, including a byte-level BPE tokenizer, decoder-only Transformer, training loop, checkpointing, evaluation, and text generation.
 
 The purpose of this project is to understand how the main components of a language model work together without relying on high-level Transformer or tokenizer libraries.
@@ -130,6 +132,9 @@ pip install -e ".[dev]"
 
 This also installs the `tiny-lm` command.
 
+`pyproject.toml` is the single source of truth for runtime and development
+dependencies. For a runtime-only installation, use `pip install -e .`.
+
 ## Dataset
 
 The model can be trained on any UTF-8 text file.
@@ -144,7 +149,7 @@ A small dataset such as Tiny Shakespeare is suitable for testing the implementat
 
 ```bash
 curl -o data/input.txt \
-  https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+  https://raw.githubusercontent.com/karpathy/char-rnn/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e/data/tinyshakespeare/input.txt
 ```
 
 Small datasets are useful for validating the pipeline, but they will not produce a generally capable language model.
@@ -247,34 +252,135 @@ Results from a completed Tiny Shakespeare training run:
 
 | Dataset | Tokenizer vocabulary | Parameters | Training steps | Training time | Validation loss | Perplexity | Device |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Tiny Shakespeare | 1,024 | 938,752 | 10,000 | 3m 38s | 3.578311 | 35.812993 | Apple M4 16 GB (MPS) |
+| Tiny Shakespeare | 1,024 | 938,752 | 10,000 | 3m 34.5s | 3.578311 | 35.812996 | Apple M4 16 GB (MPS) |
 
-The model used a context length of 128, four layers, four attention heads,
-an embedding width of 128, a batch size of 16, and seed 42. Validation loss
-and perplexity were calculated over the complete packed validation split.
+Validation loss and perplexity were calculated over every usable token in the
+complete packed validation split.
+
+### Reproduce the benchmark
+
+Download the exact dataset used by the reference run:
+
+```bash
+mkdir -p data
+curl -o data/input.txt \
+  https://raw.githubusercontent.com/karpathy/char-rnn/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e/data/tinyshakespeare/input.txt
+```
+
+SHA-256: `86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2dc565ed`
+
+Run the complete training configuration:
+
+```bash
+tiny-lm train \
+  --data-file data/input.txt \
+  --vocab-size 1024 \
+  --seq-len 128 \
+  --d-model 128 \
+  --d-ff 512 \
+  --num-heads 4 \
+  --num-layers 4 \
+  --batch-size 16 \
+  --max-steps 10000 \
+  --eval-interval 100 \
+  --eval-batches 4 \
+  --learning-rate 0.0003 \
+  --dropout 0.1 \
+  --max-token-length 40 \
+  --seed 42 \
+  --no-compile \
+  --device mps \
+  --checkpoint checkpoints/benchmark.pt \
+  --checkpoint-interval 10000
+```
+
+Calculate the reported full-split metrics:
+
+```bash
+tiny-lm evaluate checkpoints/benchmark.pt \
+  --data-file data/input.txt \
+  --split validation \
+  --batch-size 16 \
+  --device mps
+```
+
+Reference environment:
+
+* Commit: `bd2aa73`
+* PyTorch: `2.8.0`
+* macOS: `15.6`
+* Hardware: Apple M4, 16 GB unified memory
+
+The loss curves use a 100-step moving average for training loss and the
+four-batch validation estimate recorded every 100 steps:
+
+![Training and validation loss](assets/training-loss.png)
 
 ### Generated sample
 
-```text
-KING RICHARD II: yet the kinter vile and fillild my heart,
+Sampling command:
+
+```bash
+tiny-lm generate checkpoints/benchmark.pt \
+  --prompt "KING RICHARD II:" \
+  --max-new-tokens 120 \
+  --temperature 1.0 \
+  --top-k 50 \
+  --seed 7 \
+  --continue-after-eot \
+  --device mps
 ```
 
-This is an unedited sample generated with temperature 1.0, top-k 50, and seed 7.
+```text
+KING RICHARD II:
+Suk, humbertured ster of the king,
+When, the criding face that numble dathing in the golds
+Of my father digread tending night.
+
+BENVOLIO:
+Good my lordlet's father Englander,
+Unand not heard as you may as you proyer,
+Who we that did not doubt under much asken
+Than intering
+```
+
+This is unedited output. `--continue-after-eot` renders learned text boundaries
+as newlines instead of stopping at the first boundary.
 
 ## Project structure
 
 ```text
 .
-├── minibpe.py
+├── src/tiny_lm/
+│   ├── tokenizer.py
+│   ├── data.py
+│   ├── model.py
+│   ├── attention.py
+│   ├── training.py
+│   ├── evaluation.py
+│   ├── generation.py
+│   ├── checkpoint.py
+│   ├── config.py
+│   └── cli.py
 ├── tests/
+│   ├── test_tokenizer.py
+│   ├── test_data.py
+│   ├── test_model.py
+│   ├── test_generation.py
+│   ├── test_training.py
+│   └── test_checkpoint.py
+├── assets/
+│   └── training-loss.png
 ├── .github/workflows/tests.yml
 ├── README.md
 ├── CLI.md
 ├── pyproject.toml
-├── requirements.txt
 ├── data/
 └── checkpoints/
 ```
+
+Each module has one primary responsibility, so the tokenizer algorithm can be
+read independently from the CLI, training loop, and checkpoint format.
 
 Run the same checks used by CI:
 
@@ -307,7 +413,6 @@ This project helped me understand:
 * No preference optimization
 * No advanced positional embeddings such as RoPE
 * Generated text quality depends heavily on training data and compute
-* The code is currently contained primarily in a single Python module
 
 ## Roadmap
 
@@ -317,9 +422,9 @@ This project helped me understand:
 * [x] Checkpoint saving and loading
 * [x] Autoregressive text generation
 * [x] KV cache
-* [ ] Automated tests and CI (implementation complete; remote run must pass)
-* [ ] Split the implementation into separate modules
-* [ ] Add training-loss visualizations
+* [x] Modular `src/tiny_lm` package
+* [x] Automated tests and CI
+* [x] Reproducible benchmark and training-loss chart
 * [x] Add byte-level BPE
 * [x] Pack the dataset into contiguous token windows
 * [x] Add benchmark results

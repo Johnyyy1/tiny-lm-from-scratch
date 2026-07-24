@@ -19,10 +19,13 @@ dev = [
 ]
 
 [project.scripts]
-tiny-lm = "minibpe:main"
+tiny-lm = "tiny_lm.cli:main"
 
 [tool.setuptools]
-py-modules = ["minibpe"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 100
